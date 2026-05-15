@@ -430,8 +430,20 @@ const es = new EventSource("/stream");
 es.onmessage = function(e) {
   try {
     const msg = JSON.parse(e.data);
+    if (msg.type === "connected")    { setDot("ok"); }
     if (msg.type === "run_start")    { setDot("run"); }
-    if (msg.type === "run_complete") { setDot("ok"); refreshAll(); }
+    if (msg.type === "run_complete") {
+      setDot("ok");
+      refreshAll();
+      if (Notification.permission === "granted") {
+        const alerts = msg.data && msg.data.alerts_fired;
+        if (alerts && alerts > 0) {
+          new Notification("Metals Monitor", {
+            body: String(alerts) + " cluster alert(s) fired — check the dashboard.",
+          });
+        }
+      }
+    }
     if (msg.type === "run_error")    { setDot("err"); }
   } catch(_) {}
 };
@@ -605,13 +617,36 @@ async function triggerRun() {
   const btn = document.getElementById("run-btn");
   btn.disabled = true;
   btn.textContent = "Running…";
+  setDot("run");
+
   try {
-    await fetch("/api/run", { method:"POST" });
-  } catch(e) { console.error(e); }
-  setTimeout(() => {
+    const resp = await fetch("/api/run", { method: "POST" });
+    // 409 = already running — just let the existing poll below catch completion
+    if (!resp.ok && resp.status !== 409) throw new Error("HTTP " + resp.status);
+  } catch(e) {
+    console.error("run start failed:", e);
     btn.disabled = false;
     btn.textContent = "Run Now";
-  }, 5000);
+    setDot("err");
+    return;
+  }
+
+  // Poll status every 2 s until the run finishes.
+  // SSE delivers run_complete too, but polling is the reliable fallback.
+  const deadline = Date.now() + 180_000;
+  const poll = setInterval(async () => {
+    try {
+      const s = await fetch("/api/status");
+      const d = await s.json();
+      if (!d.running || Date.now() > deadline) {
+        clearInterval(poll);
+        btn.disabled = false;
+        btn.textContent = "Run Now";
+        setDot(d.last_run_ok ? "ok" : "err");
+        refreshAll();
+      }
+    } catch(_) {}
+  }, 2000);
 }
 
 // ── Web Notifications ─────────────────────────────────────────────────────────
@@ -628,24 +663,6 @@ function requestNotifPermission() {
     }
   });
 }
-
-// Wire SSE-fired run_complete to also send a Web Notification if permission granted
-const _origOnMessage = es.onmessage;
-es.onmessage = function(e) {
-  _origOnMessage(e);
-  try {
-    const msg = JSON.parse(e.data);
-    if (msg.type === "run_complete" && Notification.permission === "granted") {
-      const alerts = msg.data && msg.data.alerts_fired;
-      if (alerts && alerts > 0) {
-        new Notification("Metals Monitor", {
-          body: escHtml(String(alerts)) + " cluster alert(s) fired — check the dashboard.",
-          icon: "",
-        });
-      }
-    }
-  } catch(_) {}
-};
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 refreshAll();
