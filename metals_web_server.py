@@ -2,14 +2,22 @@
 """
 Metals Web Server — FastAPI dashboard for the Metals Monitor.
 
-Modes:
-  SCHEDULER_ENABLED=true   asyncio loop runs the monitor every SCHEDULER_INTERVAL_SECS
-                            (container / cloud mode — replaces the LaunchAgent)
-  SCHEDULER_ENABLED=false  server only exposes data already in state.json/logs
-                            (macOS LaunchAgent still runs the monitor)
+The scheduler is ON by default. On startup the server runs the monitor once
+immediately, then every SCHEDULER_INTERVAL_SECS (default 3600). No manual
+"Run Now" clicks needed for normal use.
+
+  SCHEDULER_ENABLED=true   (default) built-in asyncio scheduler — runs on
+                            startup + every hour. Works locally and in Docker.
+  SCHEDULER_ENABLED=false  scheduler off; data only updates via "Run Now" or
+                            an external process (e.g. LaunchAgent).
+
+  NOTE: if the LaunchAgent is also active, both will run independently.
+  They are safe to run concurrently (cooldown state prevents duplicate alerts),
+  but you only need one. Prefer the web server scheduler for local use so the
+  dashboard cache stays warm.
 
 Start:
-  uvicorn metals_web_server:app --host 0.0.0.0 --port 8080 [--reload]
+  uvicorn metals_web_server:app --host 0.0.0.0 --port 8080
   or: python metals_web_server.py
 """
 from __future__ import annotations
@@ -44,7 +52,7 @@ from metals_live_monitor import (
 # CONFIG
 # ──────────────────────────────────────────────────────────────────────────────
 
-SCHEDULER_ENABLED       = os.getenv("SCHEDULER_ENABLED", "false").lower() == "true"
+SCHEDULER_ENABLED       = os.getenv("SCHEDULER_ENABLED", "true").lower() == "true"
 SCHEDULER_INTERVAL_SECS = int(os.getenv("SCHEDULER_INTERVAL_SECS", "3600"))
 PORT                    = int(os.getenv("PORT", "8080"))
 LOG_TAIL_LINES          = 200
@@ -156,10 +164,11 @@ async def _run_monitor_async() -> dict:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SCHEDULER  (only active when SCHEDULER_ENABLED=true)
+# SCHEDULER
 # ──────────────────────────────────────────────────────────────────────────────
 
 async def _scheduler_loop() -> None:
+    """Run immediately on first call, then sleep and repeat."""
     while True:
         try:
             await _run_monitor_async()
@@ -178,7 +187,12 @@ app = FastAPI(title="Metals Monitor Dashboard", version="1.0")
 @app.on_event("startup")
 async def _startup() -> None:
     if SCHEDULER_ENABLED:
+        # Scheduler runs the monitor immediately on startup, then every interval.
+        # No manual "Run Now" needed for normal use.
         asyncio.create_task(_scheduler_loop())
+    else:
+        # Scheduler off — still run once on startup so the dashboard isn't empty.
+        asyncio.create_task(_run_monitor_async())
 
 
 # ── /stream — Server-Sent Events ──────────────────────────────────────────────
