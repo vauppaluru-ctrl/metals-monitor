@@ -2,6 +2,28 @@
 
 Use this before merging any change to the signal logic, web server, or infrastructure files.
 
+**Run the fast test suite first. If any test fails, fix it before reviewing the rest.**
+```bash
+.venv/bin/pytest tests/ -v -m "not slow"
+```
+See `docs/TESTING.md` for full test instructions.
+
+---
+
+## Previously-bitten gotchas (check these first)
+
+- [ ] **Python `\n` in `_DASHBOARD_HTML`** — any JavaScript newline escape inside the triple-quoted HTML string must be `\\n`, never `\n`. Python evaluates `\n` as a real newline, producing an `Invalid or unexpected token` JS SyntaxError that kills all JavaScript silently.  
+  Test: `TestJSIntegrity::test_no_js_console_errors`
+
+- [ ] **`Cache-Control: no-store` on `/`** — the dashboard route must include this header. Without it, browsers cache old JS after a server restart and bug fixes appear to have no effect.  
+  Test: `TestServer::test_cache_control_header`
+
+- [ ] **Run Now poll condition** — `triggerRun()` must stop polling only when `!d.running && d.last_run !== null`. Using `!d.running` alone fires on the first tick (2 s) before the asyncio task sets `running=true`, showing no data.  
+  Test: `TestHeaderButtons::test_run_now_click_shows_loading_state`
+
+- [ ] **No hardcoded hex in component CSS** — component rules must use only `var(--)` tokens. Hardcoded `#RRGGBB` values bypass the theme token system and break light/dark switching.  
+  Test: `TestJSIntegrity::test_no_hardcoded_hex_in_component_css`
+
 ---
 
 ## Signal integrity
