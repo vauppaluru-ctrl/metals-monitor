@@ -286,83 +286,284 @@ async def api_run() -> JSONResponse:
 # ──────────────────────────────────────────────────────────────────────────────
 
 _DASHBOARD_HTML = """<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Metals Monitor</title>
 <style>
+  /* ════════════════════════════════════════════════════════════
+     THEME TOKENS — single source of truth for all visual style.
+     Component rules below reference only var(--*) tokens.
+     To add a new theme, add a [data-theme="x"] block here.
+     ════════════════════════════════════════════════════════════ */
+
+  /* ── Typography (shared across all themes) ──────────────── */
   :root {
-    --bg:#0f1117; --card:#1a1d27; --border:#2a2d3a;
-    --text:#e2e4ec; --muted:#6b6f80; --gold:#f5c842;
-    --silver:#a8b4c8; --copper:#d4804a;
-    --bull:#3ddc84; --bear:#ff5f5f; --neutral:#6b6f80;
-    --accent:#5b8dee;
+    --font:            "SF Mono", Consolas, "Courier New", monospace;
+    --font-size-base:  14px;
+    --font-size-lg:    16px;
+    --font-size-md:    15px;
+    --font-size-sm:    12px;
+    --font-size-xs:    11px;
+    --font-size-2xs:   10px;
+    --line-height:     1.5;
+    --radius-sm:       3px;
+    --radius-md:       4px;
+    --radius-lg:       8px;
+    --radius-pill:     12px;
   }
-  * { box-sizing:border-box; margin:0; padding:0; }
-  body { background:var(--bg); color:var(--text); font:14px/1.5 "SF Mono",Consolas,monospace; }
-  header { display:flex; align-items:center; gap:12px; padding:16px 20px;
-           border-bottom:1px solid var(--border); background:var(--card); }
-  header h1 { font-size:16px; font-weight:700; letter-spacing:.5px; }
-  #status-dot { width:10px; height:10px; border-radius:50%; background:var(--muted); flex-shrink:0; }
-  #status-dot.ok  { background:var(--bull); }
-  #status-dot.err { background:var(--bear); }
-  #status-dot.run { background:var(--gold); animation:pulse 1s infinite; }
-  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
-  #last-run { margin-left:auto; font-size:11px; color:var(--muted); }
-  #run-btn { padding:5px 14px; border:1px solid var(--accent); background:transparent;
-             color:var(--accent); border-radius:4px; cursor:pointer; font-size:12px; }
-  #run-btn:hover { background:var(--accent); color:#fff; }
-  #notif-btn { padding:5px 14px; border:1px solid var(--muted); background:transparent;
-               color:var(--muted); border-radius:4px; cursor:pointer; font-size:12px; }
-  #notif-btn.granted { border-color:var(--bull); color:var(--bull); }
-  main { padding:20px; max-width:1200px; margin:0 auto; }
-  .section-title { font-size:11px; text-transform:uppercase; letter-spacing:1px;
-                   color:var(--muted); margin:24px 0 10px; }
-  .metals-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:14px; }
-  .metal-card { background:var(--card); border:1px solid var(--border);
-                border-radius:8px; padding:16px; }
-  .metal-card .name { font-size:15px; font-weight:700; margin-bottom:2px; }
-  .metal-card .name.gold   { color:var(--gold); }
-  .metal-card .name.silver { color:var(--silver); }
-  .metal-card .name.copper { color:var(--copper); }
-  .metal-card .meta { font-size:11px; color:var(--muted); margin-bottom:10px; }
-  .signals { display:flex; flex-direction:column; gap:5px; }
-  .sig-row { display:flex; justify-content:space-between; align-items:center;
-             font-size:12px; padding:3px 0; border-bottom:1px solid var(--border); }
-  .sig-row:last-child { border:none; }
-  .sig-label { color:var(--muted); }
-  .sig-val { font-weight:700; padding:1px 7px; border-radius:3px; font-size:11px; }
-  .sig-val.bullish  { background:#1a3a28; color:var(--bull); }
-  .sig-val.bearish  { background:#3a1a1a; color:var(--bear); }
-  .sig-val.neutral  { background:#252830; color:var(--muted); }
-  .cluster-badge { display:inline-block; padding:3px 10px; border-radius:12px;
-                   font-size:11px; font-weight:700; margin-top:10px; }
-  .cluster-badge.bull { background:#1a3a28; color:var(--bull); }
-  .cluster-badge.bear { background:#3a1a1a; color:var(--bear); }
-  .cluster-badge.none { background:#252830; color:var(--muted); }
-  table { width:100%; border-collapse:collapse; font-size:12px; }
-  th { text-align:left; padding:7px 10px; font-size:10px; text-transform:uppercase;
-       letter-spacing:.8px; color:var(--muted); border-bottom:1px solid var(--border); }
-  td { padding:7px 10px; border-bottom:1px solid var(--border); }
-  tr:last-child td { border:none; }
-  .pill { display:inline-block; padding:1px 7px; border-radius:10px; font-size:10px; }
-  .pill.bull { background:#1a3a28; color:var(--bull); }
-  .pill.bear { background:#3a1a1a; color:var(--bear); }
-  .tabs { display:flex; gap:2px; margin-bottom:10px; }
-  .tab { padding:5px 14px; border:1px solid var(--border); border-radius:4px;
-         cursor:pointer; font-size:12px; color:var(--muted); background:transparent; }
-  .tab.active { border-color:var(--accent); color:var(--accent); background:#141824; }
-  .tab-pane { display:none; }
-  .tab-pane.active { display:block; }
-  #log-box { background:#0a0c12; border:1px solid var(--border); border-radius:6px;
-             padding:12px; height:320px; overflow-y:auto; font-size:11px;
-             line-height:1.6; white-space:pre-wrap; word-break:break-all; }
-  .news-item { padding:8px 0; border-bottom:1px solid var(--border); font-size:12px; }
-  .news-item:last-child { border:none; }
-  .news-source { font-size:10px; color:var(--muted); margin-bottom:2px; }
-  .no-data { color:var(--muted); font-size:12px; padding:16px 0; }
-  .error-msg { color:var(--bear); font-size:12px; padding:16px 0; }
+
+  /* ── Signal & metal accent colors (fixed across themes) ─── */
+  :root {
+    --gold:    #f5c842;
+    --silver:  #a8b4c8;
+    --copper:  #d4804a;
+    --bull:    #3ddc84;
+    --bear:    #ff5f5f;
+    --accent:  #5b8dee;
+  }
+
+  /* ── Dark theme (default) ───────────────────────────────── */
+  :root,
+  [data-theme="dark"] {
+    --bg:             #0f1117;
+    --card:           #1a1d27;
+    --border:         #2a2d3a;
+    --text:           #e2e4ec;
+    --muted:          #6b6f80;
+    --log-bg:         #0a0c12;
+    --tab-active-bg:  #141824;
+    --bull-bg:        #1a3a28;
+    --bear-bg:        #3a1a1a;
+    --neutral-bg:     #252830;
+    --run-btn-hover-text: #ffffff;
+  }
+
+  /* ── Light theme ────────────────────────────────────────── */
+  [data-theme="light"] {
+    --bg:             #f3f4f9;
+    --card:           #ffffff;
+    --border:         #dde1ed;
+    --text:           #1c1f2e;
+    --muted:          #6b7080;
+    --log-bg:         #f8f9fc;
+    --tab-active-bg:  #eaedf8;
+    --bull-bg:        #e4f5ec;
+    --bear-bg:        #fce8e8;
+    --neutral-bg:     #eef0f5;
+    --run-btn-hover-text: #ffffff;
+  }
+
+  /* ════════════════════════════════════════════════════════════
+     COMPONENTS — all colors and fonts from tokens only
+     ════════════════════════════════════════════════════════════ */
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background:   var(--bg);
+    color:        var(--text);
+    font-family:  var(--font);
+    font-size:    var(--font-size-base);
+    line-height:  var(--line-height);
+    transition:   background-color 0.2s, color 0.2s, border-color 0.2s;
+  }
+
+  /* ── Header ─────────────────────────────────────────────── */
+  header {
+    display:        flex;
+    align-items:    center;
+    gap:            12px;
+    padding:        16px 20px;
+    border-bottom:  1px solid var(--border);
+    background:     var(--card);
+  }
+  header h1 {
+    font-size:      var(--font-size-lg);
+    font-weight:    700;
+    letter-spacing: .5px;
+  }
+  #status-dot {
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    background: var(--muted);
+    flex-shrink: 0;
+  }
+  #status-dot.ok  { background: var(--bull); }
+  #status-dot.err { background: var(--bear); }
+  #status-dot.run { background: var(--gold); animation: pulse 1s infinite; }
+  @keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:.3 } }
+
+  #last-run { margin-left: auto; font-size: var(--font-size-xs); color: var(--muted); }
+
+  /* ── Header buttons (shared base) ───────────────────────── */
+  .hdr-btn {
+    padding:        5px 14px;
+    border-radius:  var(--radius-md);
+    cursor:         pointer;
+    font-size:      var(--font-size-sm);
+    font-family:    var(--font);
+    background:     transparent;
+    transition:     background-color 0.15s, color 0.15s;
+  }
+  #run-btn {
+    border: 1px solid var(--accent);
+    color:  var(--accent);
+  }
+  #run-btn:hover:not(:disabled) {
+    background: var(--accent);
+    color:      var(--run-btn-hover-text);
+  }
+  #run-btn:disabled { opacity: 0.55; cursor: default; }
+
+  #notif-btn {
+    border: 1px solid var(--muted);
+    color:  var(--muted);
+  }
+  #notif-btn.granted { border-color: var(--bull); color: var(--bull); }
+
+  #theme-btn {
+    border: 1px solid var(--border);
+    color:  var(--muted);
+    min-width: 68px;
+  }
+  #theme-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+  /* ── Main layout ─────────────────────────────────────────── */
+  main { padding: 20px; max-width: 1200px; margin: 0 auto; }
+
+  .section-title {
+    font-size:      var(--font-size-xs);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color:          var(--muted);
+    margin:         24px 0 10px;
+  }
+
+  /* ── Metal cards ─────────────────────────────────────────── */
+  .metals-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 14px;
+  }
+  .metal-card {
+    background:    var(--card);
+    border:        1px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding:       16px;
+  }
+  .metal-card .name {
+    font-size:     var(--font-size-md);
+    font-weight:   700;
+    margin-bottom: 2px;
+  }
+  .metal-card .name.gold   { color: var(--gold); }
+  .metal-card .name.silver { color: var(--silver); }
+  .metal-card .name.copper { color: var(--copper); }
+  .metal-card .meta { font-size: var(--font-size-xs); color: var(--muted); margin-bottom: 10px; }
+
+  /* ── Signal rows ─────────────────────────────────────────── */
+  .signals { display: flex; flex-direction: column; gap: 5px; }
+  .sig-row {
+    display:         flex;
+    justify-content: space-between;
+    align-items:     center;
+    font-size:       var(--font-size-sm);
+    padding:         3px 0;
+    border-bottom:   1px solid var(--border);
+  }
+  .sig-row:last-child { border: none; }
+  .sig-label { color: var(--muted); }
+  .sig-val {
+    font-weight:   700;
+    padding:       1px 7px;
+    border-radius: var(--radius-sm);
+    font-size:     var(--font-size-xs);
+  }
+  .sig-val.bullish { background: var(--bull-bg); color: var(--bull); }
+  .sig-val.bearish { background: var(--bear-bg); color: var(--bear); }
+  .sig-val.neutral { background: var(--neutral-bg); color: var(--muted); }
+
+  /* ── Cluster badge ───────────────────────────────────────── */
+  .cluster-badge {
+    display:       inline-block;
+    padding:       3px 10px;
+    border-radius: var(--radius-pill);
+    font-size:     var(--font-size-xs);
+    font-weight:   700;
+    margin-top:    10px;
+  }
+  .cluster-badge.bull { background: var(--bull-bg); color: var(--bull); }
+  .cluster-badge.bear { background: var(--bear-bg); color: var(--bear); }
+  .cluster-badge.none { background: var(--neutral-bg); color: var(--muted); }
+
+  /* ── Table ───────────────────────────────────────────────── */
+  table { width: 100%; border-collapse: collapse; font-size: var(--font-size-sm); }
+  th {
+    text-align:     left;
+    padding:        7px 10px;
+    font-size:      var(--font-size-2xs);
+    text-transform: uppercase;
+    letter-spacing: .8px;
+    color:          var(--muted);
+    border-bottom:  1px solid var(--border);
+  }
+  td { padding: 7px 10px; border-bottom: 1px solid var(--border); }
+  tr:last-child td { border: none; }
+
+  .pill {
+    display:       inline-block;
+    padding:       1px 7px;
+    border-radius: var(--radius-pill);
+    font-size:     var(--font-size-2xs);
+  }
+  .pill.bull { background: var(--bull-bg); color: var(--bull); }
+  .pill.bear { background: var(--bear-bg); color: var(--bear); }
+
+  /* ── Tabs ────────────────────────────────────────────────── */
+  .tabs { display: flex; gap: 2px; margin-bottom: 10px; }
+  .tab {
+    padding:       5px 14px;
+    border:        1px solid var(--border);
+    border-radius: var(--radius-md);
+    cursor:        pointer;
+    font-size:     var(--font-size-sm);
+    font-family:   var(--font);
+    color:         var(--muted);
+    background:    transparent;
+  }
+  .tab.active {
+    border-color: var(--accent);
+    color:        var(--accent);
+    background:   var(--tab-active-bg);
+  }
+  .tab-pane          { display: none; }
+  .tab-pane.active   { display: block; }
+
+  /* ── Log box ─────────────────────────────────────────────── */
+  #log-box {
+    background:   var(--log-bg);
+    border:       1px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding:      12px;
+    height:       320px;
+    overflow-y:   auto;
+    font-size:    var(--font-size-xs);
+    line-height:  1.6;
+    white-space:  pre-wrap;
+    word-break:   break-all;
+    color:        var(--text);
+  }
+
+  /* ── News ────────────────────────────────────────────────── */
+  .news-item { padding: 8px 0; border-bottom: 1px solid var(--border); font-size: var(--font-size-sm); }
+  .news-item:last-child { border: none; }
+  .news-source { font-size: var(--font-size-2xs); color: var(--muted); margin-bottom: 2px; }
+
+  /* ── Utility ─────────────────────────────────────────────── */
+  .no-data   { color: var(--muted); font-size: var(--font-size-sm); padding: 16px 0; }
+  .error-msg { color: var(--bear);  font-size: var(--font-size-sm); padding: 16px 0; }
 </style>
 </head>
 <body>
@@ -370,8 +571,9 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   <div id="status-dot"></div>
   <h1>Metals Monitor</h1>
   <span id="last-run">No data yet</span>
-  <button id="notif-btn" onclick="requestNotifPermission()">Enable Notifications</button>
-  <button id="run-btn" onclick="triggerRun()">Run Now</button>
+  <button id="theme-btn"  class="hdr-btn" onclick="toggleTheme()">Light</button>
+  <button id="notif-btn"  class="hdr-btn" onclick="requestNotifPermission()">Enable Notifications</button>
+  <button id="run-btn"    class="hdr-btn" onclick="triggerRun()">Run Now</button>
 </header>
 <main>
   <div class="section-title">Signal Status</div>
@@ -410,6 +612,28 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
 
 <script>
 "use strict";
+
+// ── Theme ─────────────────────────────────────────────────────────────────────
+// Single function that owns ALL theme state. Everything else calls applyTheme().
+function applyTheme(theme) {
+  document.documentElement.setAttribute("data-theme", theme);
+  const btn = document.getElementById("theme-btn");
+  if (btn) btn.textContent = theme === "dark" ? "Light" : "Dark";
+  try { localStorage.setItem("mm-theme", theme); } catch(_) {}
+}
+
+function toggleTheme() {
+  const current = document.documentElement.getAttribute("data-theme") || "dark";
+  applyTheme(current === "dark" ? "light" : "dark");
+}
+
+// Resolve initial theme: localStorage > OS preference > dark
+(function() {
+  let saved;
+  try { saved = localStorage.getItem("mm-theme"); } catch(_) {}
+  const osLight = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches;
+  applyTheme(saved || (osLight ? "light" : "dark"));
+})();
 
 // ── XSS-safe escaping ─────────────────────────────────────────────────────────
 function escHtml(s) {
