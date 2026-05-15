@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+metals_monitor_state/
+metals_monitor_logs/
+metals_backtest_output/
+*.log
+*.plist
+*.plist.template
+install_launch_agent.sh
+uninstall_launch_agent.sh
+metals_backtest.py
+README.md
+.git/

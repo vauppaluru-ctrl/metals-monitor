@@ -1,0 +1,26 @@
+services:
+  metals-monitor:
+    build: .
+    container_name: metals-monitor
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - SCHEDULER_ENABLED=true
+      - SCHEDULER_INTERVAL_SECS=3600
+      - PORT=8080
+    volumes:
+      # Persist state (cooldowns, alert history) and logs across restarts
+      - metals-state:/app/metals_monitor/metals_monitor_state
+      - metals-logs:/app/metals_monitor/metals_monitor_logs
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8080/api/status', timeout=8)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  metals-state:
+  metals-logs:

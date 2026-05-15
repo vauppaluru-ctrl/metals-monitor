@@ -1,0 +1,32 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Runtime data (preserved locally, not version-controlled)
+metals_monitor_state/
+metals_monitor_logs/
+metals_backtest_output/
+*.log
+
+# Generated files (created by install script from template)
+com.local.metalsmonitor.plist
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Docker
+.env

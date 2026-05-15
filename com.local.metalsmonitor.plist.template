@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+
+    <!-- Unique label for launchd -->
+    <key>Label</key>
+    <string>com.local.metalsmonitor</string>
+
+    <!-- Full absolute paths: set by install_launch_agent.sh via sed substitution -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{PYTHON_PATH}}</string>
+        <string>{{SCRIPT_PATH}}</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>{{PROJECT_DIR}}</string>
+
+    <!-- Run every 3600 seconds (1 hour) while the Mac is awake -->
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <!-- Also run immediately on login / launchd load -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Redirect stdout and stderr to log files inside the project -->
+    <key>StandardOutPath</key>
+    <string>{{LOG_DIR}}/metals_monitor_stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>{{LOG_DIR}}/metals_monitor_stderr.log</string>
+
+    <!-- Provide a minimal PATH so Python and osascript can be found -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+
+    <!-- Run as a background daemon (no UI access needed except osascript) -->
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <!-- Prevent rapid-restart loops if the script crashes repeatedly -->
+    <key>ThrottleInterval</key>
+    <integer>300</integer>
+
+</dict>
+</plist>
