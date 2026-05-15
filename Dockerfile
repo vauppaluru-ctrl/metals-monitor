@@ -16,11 +16,11 @@ RUN mkdir -p metals_monitor_state metals_monitor_logs metals_backtest_output
 ENV PYTHONUNBUFFERED=1 \
     SCHEDULER_ENABLED=true \
     SCHEDULER_INTERVAL_SECS=3600 \
-    PORT=8080
+    PORT=8747
 
-EXPOSE 8080
+EXPOSE 8747
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
-  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/api/status', timeout=8)"
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8747/api/status', timeout=8)"
 
 CMD ["python", "metals_web_server.py"]

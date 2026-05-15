@@ -32,7 +32,7 @@ launchctl print gui/$(id -u)/com.local.metalsmonitor
 ### Start the web dashboard (separate step)
 
 ```bash
-.venv/bin/uvicorn metals_web_server:app --host 0.0.0.0 --port 8080
+.venv/bin/uvicorn metals_web_server:app --host 0.0.0.0 --port 8747
 ```
 
 Set `SCHEDULER_ENABLED=false` (the default) so the dashboard does not also run a scheduler loop — the LaunchAgent handles scheduling.
@@ -58,7 +58,7 @@ Single container runs both the web server and the built-in asyncio scheduler. No
 
 ### Prerequisites
 - Docker Desktop (local) or Docker Engine (server)
-- Port 8080 available
+- Port 8747 available
 
 ### Build and run
 
@@ -74,7 +74,7 @@ docker compose up --build -d       # background (detached)
 |---|---|---|
 | `SCHEDULER_ENABLED` | `true` | Run hourly monitor loop inside the container |
 | `SCHEDULER_INTERVAL_SECS` | `3600` | Seconds between monitor runs |
-| `PORT` | `8080` | Web server port (must match `ports:` in compose) |
+| `PORT` | `8747` | Web server port (must match `ports:` in compose) |
 
 Override in `docker-compose.yml` or with `-e` flags.
 
@@ -118,16 +118,16 @@ The Docker image runs identically on any cloud that accepts containers. Notes:
 
 ### Fly.io (simplest)
 ```bash
-fly launch --name metals-monitor --port 8080
+fly launch --name metals-monitor --port 8747
 fly deploy
 fly logs
 ```
 
 ### Railway / Render
-Point to the repository; set `PORT=8080`, `SCHEDULER_ENABLED=true`. Both auto-detect `Dockerfile`.
+Point to the repository; set `PORT=8747`, `SCHEDULER_ENABLED=true`. Both auto-detect `Dockerfile`.
 
 ### AWS ECS / GCP Cloud Run
-Push image to ECR or Artifact Registry, create a task/service with port 8080 and the two volumes (EFS on ECS, Cloud Filestore on GCP for persistence).
+Push image to ECR or Artifact Registry, create a task/service with port 8747 and the two volumes (EFS on ECS, Cloud Filestore on GCP for persistence).
 
 ### Notifications on cloud
 `osascript` (macOS only) silently fails on Linux containers. Use the **web notifications** button in the dashboard header instead. The SSE stream delivers alert events to any open browser tab regardless of platform.

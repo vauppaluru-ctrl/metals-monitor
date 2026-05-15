@@ -28,7 +28,7 @@ The system has three components:
 | Component | What it does | When it runs |
 |---|---|---|
 | **Live Monitor** (`metals_live_monitor.py`) | Downloads recent OHLCV data for GLD, SLV, CPER; computes 4 proxy signals per metal; fires a macOS notification if ≥2 signals align | Hourly via LaunchAgent (or Docker scheduler) |
-| **Web Dashboard** (`metals_web_server.py`) | FastAPI server at `http://localhost:8080` showing signal cards, alert history, news, and logs in real time | Manual start or Docker always-on |
+| **Web Dashboard** (`metals_web_server.py`) | FastAPI server at `http://localhost:8747` showing signal cards, alert history, news, and logs in real time | Manual start or Docker always-on |
 | **Backtest** (`metals_backtest.py`) | One-year event study (2025-05-15 → 2026-05-15) to validate the signal logic on historical data | Manual only |
 
 The three metals are evaluated **independently**. No cross-metal inference is ever made.
@@ -56,10 +56,10 @@ The monitor will now run **every hour while your Mac is awake** and at every log
 ### Start the web dashboard
 
 ```bash
-.venv/bin/uvicorn metals_web_server:app --host 0.0.0.0 --port 8080
+.venv/bin/uvicorn metals_web_server:app --host 0.0.0.0 --port 8747
 ```
 
-Open `http://localhost:8080` in your browser and bookmark it.
+Open `http://localhost:8747` in your browser and bookmark it.
 
 ### Docker (container / cloud)
 
@@ -68,7 +68,7 @@ cd metals_monitor
 docker compose up --build -d
 ```
 
-Open `http://localhost:8080`. The container runs the scheduler internally — no LaunchAgent needed.
+Open `http://localhost:8747`. The container runs the scheduler internally — no LaunchAgent needed.
 
 ---
 
@@ -109,7 +109,7 @@ Treat all signals as indicative only. See full disclaimer in [Section 12](#12-di
 
 ## 4. Reading the dashboard
 
-Open `http://localhost:8080` after starting the web server.
+Open `http://localhost:8747` after starting the web server.
 
 ### Signal cards (top section)
 One card per metal. Each card shows:
@@ -263,10 +263,10 @@ docker compose down
 The container:
 - Runs `metals_web_server.py` with `SCHEDULER_ENABLED=true`
 - Fetches data and evaluates signals every `SCHEDULER_INTERVAL_SECS` (default 3600)
-- Exposes port 8080
+- Exposes port 8747
 - Persists state and logs via named Docker volumes
 
-**For cloud deployment** (AWS, GCP, Fly.io, Railway, etc.) expose port 8080 and set `SCHEDULER_ENABLED=true`. No other changes needed. Note that cloud servers do not run macOS, so `osascript` notifications will silently fail — use web notifications from the dashboard instead.
+**For cloud deployment** (AWS, GCP, Fly.io, Railway, etc.) expose port 8747 and set `SCHEDULER_ENABLED=true`. No other changes needed. Note that cloud servers do not run macOS, so `osascript` notifications will silently fail — use web notifications from the dashboard instead.
 
 ---
 

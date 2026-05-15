@@ -17,7 +17,7 @@ immediately, then every SCHEDULER_INTERVAL_SECS (default 3600). No manual
   dashboard cache stays warm.
 
 Start:
-  uvicorn metals_web_server:app --host 0.0.0.0 --port 8080
+  uvicorn metals_web_server:app --host 0.0.0.0 --port 8747
   or: python metals_web_server.py
 """
 from __future__ import annotations
@@ -28,11 +28,13 @@ import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import AsyncGenerator
 
+import pandas as pd
 import uvicorn
+import yfinance as yf
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
@@ -54,7 +56,7 @@ from metals_live_monitor import (
 
 SCHEDULER_ENABLED       = os.getenv("SCHEDULER_ENABLED", "true").lower() == "true"
 SCHEDULER_INTERVAL_SECS = int(os.getenv("SCHEDULER_INTERVAL_SECS", "3600"))
-PORT                    = int(os.getenv("PORT", "8080"))
+PORT                    = int(os.getenv("PORT", "8747"))
 LOG_TAIL_LINES          = 200
 BASE_DIR                = Path(__file__).parent.resolve()
 
@@ -63,11 +65,13 @@ BASE_DIR                = Path(__file__).parent.resolve()
 # ──────────────────────────────────────────────────────────────────────────────
 
 _cache: dict = {
-    "last_run":     None,   # ISO timestamp
-    "last_run_ok":  None,   # bool
-    "metals":       {},     # { metal: evaluate_latest() result }
-    "news":         {},     # fetch_news_sentiment() result
-    "running":      False,  # True while a run is in progress
+    "last_run":          None,   # ISO timestamp
+    "last_run_ok":       None,   # bool
+    "metals":            {},     # { metal: evaluate_latest() result }
+    "news":              {},     # fetch_news_sentiment() result
+    "running":           False,  # True while a monitor run is in progress
+    "backtest":          None,   # backtest results dict
+    "backtest_running":  False,  # True while backtest is in progress
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -96,7 +100,8 @@ def _broadcast(event_type: str, data: dict) -> None:
 # MONITOR EXECUTION (runs in thread pool — never blocks the event loop)
 # ──────────────────────────────────────────────────────────────────────────────
 
-_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="monitor")
+_executor    = ThreadPoolExecutor(max_workers=1, thread_name_prefix="monitor")
+_bt_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="backtest")
 
 
 def _run_monitor_sync() -> dict:
@@ -175,6 +180,127 @@ async def _scheduler_loop() -> None:
         except Exception:
             pass
         await asyncio.sleep(SCHEDULER_INTERVAL_SECS)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# BACKTEST  (runs in separate thread pool — never blocks the event loop)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _run_backtest_sync(years: int = 3) -> dict:
+    """Download {years} years of OHLCV per metal; detect cluster events; return forward returns.
+
+    Uses the same compute_metrics / generate_signals logic as the live monitor so
+    signal definitions stay in sync.  No state.json writes — read-only.
+    """
+    end_dt   = datetime.now()
+    warmup   = 150  # calendar days before the analysis window (covers 60d vol warmup)
+    start_dt = end_dt - timedelta(days=years * 365 + warmup)
+
+    events: list = []
+    summary: dict = {}
+
+    for metal, cfg in METALS.items():
+        ticker = cfg["primary"]
+        try:
+            raw = yf.download(
+                ticker,
+                start=start_dt.strftime("%Y-%m-%d"),
+                end=(end_dt + timedelta(days=1)).strftime("%Y-%m-%d"),
+                auto_adjust=True, progress=False,
+            )
+        except Exception:
+            continue
+        if raw.empty:
+            continue
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
+        df = raw[["Open", "High", "Low", "Close", "Volume"]].copy()
+        df.index = pd.to_datetime(df.index)
+        df.index.name = "Date"
+        df.sort_index(inplace=True)
+        df.dropna(how="all", inplace=True)
+
+        try:
+            metrics = compute_metrics(df)
+            signals = generate_signals(metrics)
+        except Exception:
+            continue
+
+        # Filter to the 3-year analysis window; drop warmup rows before cutoff.
+        # reset_index moves the DatetimeIndex into a "Date" column.
+        cutoff = pd.Timestamp(end_dt - timedelta(days=years * 365))
+        window = (
+            signals[signals.index >= cutoff]
+            .dropna(subset=["vol_60d"])
+            .reset_index(drop=False)
+        )
+        if window.empty:
+            continue
+
+        last_i = -999  # positional index of the last event (3-trading-day cooldown)
+        for i, row in window.iterrows():
+            n_bull = sum(1 for c in SIGNAL_COLS if row[c] == "bullish")
+            n_bear = sum(1 for c in SIGNAL_COLS if row[c] == "bearish")
+            if n_bull < 2 and n_bear < 2:
+                continue
+            direction = "bullish" if n_bull >= n_bear else "bearish"
+            if i - last_i < 3:  # positional cooldown (3 trading days)
+                continue
+            last_i = i
+
+            close = float(row["Close"])
+            fwd: dict = {}
+            for d in (1, 3, 5, 10, 20):
+                j = i + d
+                if j < len(window):
+                    fwd_close = float(window.iloc[j]["Close"])
+                    fwd[f"fwd_{d}d"] = round((fwd_close - close) / close * 100, 2)
+                else:
+                    fwd[f"fwd_{d}d"] = None
+
+            events.append({
+                "date":       row["Date"].strftime("%Y-%m-%d"),
+                "metal":      metal,
+                "ticker":     ticker,
+                "direction":  direction,
+                "n_signals":  n_bull if direction == "bullish" else n_bear,
+                "categories": [c for c in SIGNAL_COLS if row[c] == direction],
+                "close":      round(close, 2),
+                **fwd,
+            })
+
+        # Summary stats for this metal
+        for dir_ in ("bullish", "bearish"):
+            evs = [e for e in events if e["metal"] == metal and e["direction"] == dir_]
+            if not evs:
+                continue
+            s: dict = {"metal": metal, "direction": dir_, "count": len(evs)}
+            for days in (5, 10):
+                rets = [e[f"fwd_{days}d"] for e in evs if e[f"fwd_{days}d"] is not None]
+                if rets:
+                    wins = [r for r in rets
+                            if (dir_ == "bullish" and r > 0) or (dir_ == "bearish" and r < 0)]
+                    s[f"win_rate_{days}d"] = round(len(wins) / len(rets) * 100, 1)
+                    s[f"avg_ret_{days}d"]  = round(sum(rets) / len(rets), 2)
+                else:
+                    s[f"win_rate_{days}d"] = None
+                    s[f"avg_ret_{days}d"]  = None
+            summary[f"{metal}_{dir_}"] = s
+
+    events.sort(key=lambda e: e["date"], reverse=True)
+    return {"events": events, "summary": summary, "years": years}
+
+
+async def _run_backtest_async() -> None:
+    loop = asyncio.get_running_loop()
+    _cache["backtest_running"] = True
+    try:
+        result = await loop.run_in_executor(_bt_executor, _run_backtest_sync)
+        _cache["backtest"] = result
+    except Exception as exc:
+        _cache["backtest"] = {"error": str(exc), "events": [], "summary": {}, "years": 3}
+    finally:
+        _cache["backtest_running"] = False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -292,6 +418,24 @@ async def api_run() -> JSONResponse:
     if _cache["running"]:
         raise HTTPException(status_code=409, detail="Run already in progress")
     asyncio.create_task(_run_monitor_async())
+    return JSONResponse({"status": "started"})
+
+
+# ── /api/backtest ─────────────────────────────────────────────────────────────
+
+@app.get("/api/backtest")
+async def api_backtest() -> JSONResponse:
+    return JSONResponse({
+        "running": _cache["backtest_running"],
+        "data":    _cache["backtest"],
+    })
+
+
+@app.post("/api/backtest/run")
+async def api_backtest_run() -> JSONResponse:
+    if _cache["backtest_running"]:
+        raise HTTPException(status_code=409, detail="Backtest already running")
+    asyncio.create_task(_run_backtest_async())
     return JSONResponse({"status": "started"})
 
 
@@ -578,6 +722,45 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   /* ── Utility ─────────────────────────────────────────────── */
   .no-data   { color: var(--muted); font-size: var(--font-size-sm); padding: 16px 0; }
   .error-msg { color: var(--bear);  font-size: var(--font-size-sm); padding: 16px 0; }
+
+  /* ── Backtest ────────────────────────────────────────────── */
+  .bt-header {
+    display:         flex;
+    align-items:     center;
+    justify-content: space-between;
+    margin-bottom:   12px;
+  }
+  .bt-status { font-size: var(--font-size-xs); color: var(--muted); }
+  #bt-run-btn { border: 1px solid var(--accent); color: var(--accent); }
+  #bt-run-btn:hover:not(:disabled) { background: var(--accent); color: var(--run-btn-hover-text); }
+  #bt-run-btn:disabled { opacity: 0.55; cursor: default; }
+  .bt-summary-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+    gap: 12px;
+    margin-bottom: 16px;
+  }
+  .bt-card {
+    background:    var(--card);
+    border:        1px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding:       14px;
+  }
+  .bt-card-title { font-size: var(--font-size-sm); font-weight: 700; margin-bottom: 8px; }
+  .bt-stat {
+    display:         flex;
+    justify-content: space-between;
+    font-size:       var(--font-size-xs);
+    padding:         3px 0;
+    border-bottom:   1px solid var(--border);
+  }
+  .bt-stat:last-child { border: none; }
+  .bt-stat-label { color: var(--muted); }
+  .bt-stat-val   { font-weight: 700; }
+  .bt-table-wrap { overflow-x: auto; }
+  .fwd-pos { color: var(--bull); font-weight: 700; }
+  .fwd-neg { color: var(--bear); font-weight: 700; }
+  .fwd-nil { color: var(--muted); }
 </style>
 </head>
 <body>
@@ -621,6 +804,24 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
   <div id="pane-logs" class="tab-pane">
     <div id="log-box">Loading logs…</div>
+  </div>
+
+  <div class="section-title">3-Year Backtest</div>
+  <div class="bt-header">
+    <span class="bt-status" id="bt-status">No backtest data — click Run Backtest</span>
+    <button class="hdr-btn" id="bt-run-btn" onclick="triggerBacktest()">Run Backtest</button>
+  </div>
+  <div class="bt-summary-grid" id="bt-summary-grid"></div>
+  <div class="bt-table-wrap">
+    <table id="bt-events-table">
+      <thead><tr>
+        <th>Date</th><th>Metal</th><th>Dir</th><th>Sigs</th><th>Close</th>
+        <th>1d%</th><th>3d%</th><th>5d%</th><th>10d%</th><th>20d%</th>
+      </tr></thead>
+      <tbody id="bt-events-body">
+        <tr><td colspan="10" class="no-data" style="padding:12px 10px">No backtest data yet — click Run Backtest (~30–60s)</td></tr>
+      </tbody>
+    </table>
   </div>
 </main>
 
@@ -910,6 +1111,111 @@ function requestNotifPermission() {
   });
 }
 
+// ── Backtest ──────────────────────────────────────────────────────────────────
+async function triggerBacktest() {
+  const btn    = document.getElementById("bt-run-btn");
+  const status = document.getElementById("bt-status");
+  btn.disabled       = true;
+  btn.textContent    = "Running…";
+  status.textContent = "Downloading 3 years of data per metal (~30–60s)…";
+
+  try {
+    const resp = await fetch("/api/backtest/run", { method: "POST" });
+    if (!resp.ok && resp.status !== 409) throw new Error("HTTP " + resp.status);
+  } catch(e) {
+    console.error("backtest start failed:", e);
+    btn.disabled       = false;
+    btn.textContent    = "Run Backtest";
+    status.textContent = "Error starting backtest — check logs";
+    return;
+  }
+
+  const deadline = Date.now() + 300_000;
+  const poll = setInterval(async () => {
+    try {
+      const r = await fetch("/api/backtest");
+      const d = await r.json();
+      if (!d.running && d.data) {
+        clearInterval(poll);
+        btn.disabled       = false;
+        btn.textContent    = "Run Backtest";
+        const n = (d.data.events || []).length;
+        status.textContent = "Complete — " + n + " cluster events in 3yr window";
+        renderBtSummary(d.data.summary);
+        renderBtEvents(d.data.events);
+      } else if (Date.now() > deadline) {
+        clearInterval(poll);
+        btn.disabled       = false;
+        btn.textContent    = "Run Backtest";
+        status.textContent = "Timed out — check logs";
+      }
+    } catch(_) {}
+  }, 3000);
+}
+
+function fwdCell(val) {
+  if (val === null || val === undefined) return "<td class='fwd-nil'>—</td>";
+  const cls  = val > 0 ? "fwd-pos" : val < 0 ? "fwd-neg" : "fwd-nil";
+  const sign = val > 0 ? "+" : "";
+  return "<td class='" + cls + "'>" + sign + val.toFixed(2) + "%</td>";
+}
+
+function renderBtSummary(summary) {
+  const grid = document.getElementById("bt-summary-grid");
+  if (!summary || !Object.keys(summary).length) { grid.innerHTML = ""; return; }
+  let html = "";
+  for (const [, s] of Object.entries(summary)) {
+    const cls    = escHtml(METAL_CLASS[s.metal] || "");
+    const dirCls = s.direction === "bullish" ? "bull" : "bear";
+    const dirLbl = s.direction === "bullish" ? "▲ Bullish" : "▼ Bearish";
+    const fmt = (v, pct) =>
+      v !== null && v !== undefined ? (pct && v >= 0 ? "+" : "") + v + "%" : "—";
+    html +=
+      "<div class='bt-card'>" +
+        "<div class='bt-card-title'>" +
+          "<span style='color:var(--" + cls + ")'>" + escHtml(s.metal) + "</span>" +
+          "<span class='pill " + dirCls + "' style='margin-left:6px'>" + dirLbl + "</span>" +
+        "</div>" +
+        "<div class='bt-stat'><span class='bt-stat-label'>Events (3yr)</span>" +
+          "<span class='bt-stat-val'>" + s.count + "</span></div>" +
+        "<div class='bt-stat'><span class='bt-stat-label'>Win rate 5d</span>" +
+          "<span class='bt-stat-val'>" + fmt(s.win_rate_5d, false) + "</span></div>" +
+        "<div class='bt-stat'><span class='bt-stat-label'>Avg return 5d</span>" +
+          "<span class='bt-stat-val'>" + fmt(s.avg_ret_5d, true) + "</span></div>" +
+        "<div class='bt-stat'><span class='bt-stat-label'>Win rate 10d</span>" +
+          "<span class='bt-stat-val'>" + fmt(s.win_rate_10d, false) + "</span></div>" +
+        "<div class='bt-stat'><span class='bt-stat-label'>Avg return 10d</span>" +
+          "<span class='bt-stat-val'>" + fmt(s.avg_ret_10d, true) + "</span></div>" +
+      "</div>";
+  }
+  grid.innerHTML = html;
+}
+
+function renderBtEvents(events) {
+  const tbody = document.getElementById("bt-events-body");
+  if (!events || !events.length) {
+    tbody.innerHTML = "<tr><td colspan='10' class='no-data' style='padding:12px 10px'>No cluster events detected in 3-year window</td></tr>";
+    return;
+  }
+  let html = "";
+  for (const ev of events) {
+    const dir  = escHtml(ev.direction || "");
+    const cls  = escHtml(METAL_CLASS[ev.metal] || "");
+    const cats = (ev.categories || []).map(c => c.replace("_proxy","").replace(/_/g," ")).join(", ");
+    html +=
+      "<tr>" +
+        "<td>" + escHtml(ev.date || "") + "</td>" +
+        "<td style='color:var(--" + cls + ")'>" + escHtml(ev.metal || "") + "</td>" +
+        "<td><span class='pill " + (dir === "bullish" ? "bull" : "bear") + "'>" + dir + "</span></td>" +
+        "<td title='" + escHtml(cats) + "'>" + (ev.n_signals || 0) + "/4</td>" +
+        "<td>$" + escHtml(String(ev.close || "")) + "</td>" +
+        fwdCell(ev.fwd_1d) + fwdCell(ev.fwd_3d) + fwdCell(ev.fwd_5d) +
+        fwdCell(ev.fwd_10d) + fwdCell(ev.fwd_20d) +
+      "</tr>";
+  }
+  tbody.innerHTML = html;
+}
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 (async () => {
   try {
@@ -919,6 +1225,18 @@ function requestNotifPermission() {
     else if (d.last_run_ok)    setDot("ok");
   } catch(_) {}
   refreshAll();
+  // Restore backtest results if already computed this session
+  try {
+    const br = await fetch("/api/backtest");
+    const bd = await br.json();
+    if (bd.data && bd.data.events) {
+      const n = bd.data.events.length;
+      document.getElementById("bt-status").textContent =
+        "Complete — " + n + " cluster events in 3yr window";
+      renderBtSummary(bd.data.summary);
+      renderBtEvents(bd.data.events);
+    }
+  } catch(_) {}
 })();
 setInterval(refreshAll, 60_000);
 

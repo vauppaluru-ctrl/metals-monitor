@@ -1,14 +1,14 @@
 """
 Pytest fixtures for the Metals Monitor dashboard tests.
 
-Assumes the web server is already running on BASE_URL (default: http://localhost:8080).
-Start it before running: .venv/bin/uvicorn metals_web_server:app --host 0.0.0.0 --port 8080
+Assumes the web server is already running on BASE_URL (default: http://localhost:8747).
+Start it before running: .venv/bin/uvicorn metals_web_server:app --host 0.0.0.0 --port 8747
 """
 import time
 import pytest
 import requests
 
-BASE_URL = "http://localhost:8080"
+BASE_URL = "http://localhost:8747"
 
 
 def pytest_configure(config):
@@ -28,7 +28,7 @@ def require_server():
         time.sleep(1)
     pytest.exit(
         f"Server not reachable at {BASE_URL}. "
-        "Start it with: .venv/bin/uvicorn metals_web_server:app --host 0.0.0.0 --port 8080",
+        "Start it with: .venv/bin/uvicorn metals_web_server:app --host 0.0.0.0 --port 8747",
         returncode=3,
     )
 
