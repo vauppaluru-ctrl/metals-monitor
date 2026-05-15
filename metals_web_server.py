@@ -631,14 +631,22 @@ async function triggerRun() {
     return;
   }
 
-  // Poll status every 2 s until the run finishes.
-  // SSE delivers run_complete too, but polling is the reliable fallback.
+  // Show loading placeholder in the signal cards immediately.
+  document.getElementById("metals-grid").innerHTML =
+    "<div class='no-data'>Downloading &amp; computing signals… (~30s)</div>";
+
+  // Poll /api/status every 2 s.
+  // Stop only when last_run is set (a run actually completed), not just when
+  // running=false — avoids a race where the first poll fires before the asyncio
+  // task has started, sees running=false + last_run=null, and quits early.
   const deadline = Date.now() + 180_000;
   const poll = setInterval(async () => {
     try {
       const s = await fetch("/api/status");
       const d = await s.json();
-      if (!d.running || Date.now() > deadline) {
+      const done = d.last_run !== null && !d.running;
+      const timedOut = Date.now() > deadline;
+      if (done || timedOut) {
         clearInterval(poll);
         btn.disabled = false;
         btn.textContent = "Run Now";
@@ -665,7 +673,15 @@ function requestNotifPermission() {
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
-refreshAll();
+(async () => {
+  try {
+    const s = await fetch("/api/status");
+    const d = await s.json();
+    if (d.running)             setDot("run");
+    else if (d.last_run_ok)    setDot("ok");
+  } catch(_) {}
+  refreshAll();
+})();
 setInterval(refreshAll, 60_000);
 
 if (Notification.permission === "granted") {
@@ -681,7 +697,10 @@ if (Notification.permission === "granted") {
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard() -> HTMLResponse:
-    return HTMLResponse(_DASHBOARD_HTML)
+    return HTMLResponse(
+        _DASHBOARD_HTML,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
