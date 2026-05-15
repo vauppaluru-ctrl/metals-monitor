@@ -717,7 +717,7 @@ async function refreshLogs() {
     const r = await fetch("/api/logs");
     const d = await r.json();
     const box = document.getElementById("log-box");
-    const lines = (d.lines || []).map(l => escHtml(l)).join("\n");
+    const lines = (d.lines || []).map(l => escHtml(l)).join("\\n");
     box.innerHTML = lines || "<span style='color:var(--muted)'>No log entries</span>";
     box.scrollTop = box.scrollHeight;
   } catch(e) { console.error("logs fetch", e); }
