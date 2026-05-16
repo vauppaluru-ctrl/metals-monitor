@@ -1,0 +1,19 @@
+{
+  "metals_live_monitor.py": 1778860338.0486434,
+  "metals_backtest.py": 1778857187.3094811,
+  "metals_web_server.py": 1778864469.377027,
+  "tests/conftest.py": 1778864799.3033335,
+  "tests/test_dashboard.py": 1778864809.4072368,
+  "USER_GUIDE.md": 1778864764.8947084,
+  "requirements.txt": 1778863479.9317434,
+  "README.md": 1778857311.926643,
+  "CLAUDE.md": 1778863529.950248,
+  "docs/TESTING.md": 1778863503.6594334,
+  "docs/CODE_REVIEW.md": 1778863540.9204204,
+  "docs/DEPLOYMENT.md": 1778864764.895492,
+  "docs/SECURITY.md": 1778861559.1308017,
+  "metals_backtest_output/metals-monitor-backtest.md": 1778858008.0188107,
+  "metals_backtest_output/metals_proxy_performance.png": 1778858007.6526284,
+  "metals_backtest_output/metals_event_counts.png": 1778858007.7471592,
+  "metals_backtest_output/metals_forward_returns.png": 1778858007.9728544
+}

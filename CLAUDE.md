@@ -24,6 +24,22 @@ A fully local macOS metals signal monitor (Gold / Silver / Copper) plus a FastAP
 
 ---
 
+## Start of every session
+
+Before touching any code or answering any implementation question, run:
+
+```
+/graphify .
+```
+
+The graph at `graphify-out/graph.json` gives you a 18x token-compressed view of the codebase — god nodes, community structure, and cross-file relationships — without reading every file. Use `/graphify query "<question>"` to navigate it instead of reading source files cold.
+
+If the graph is stale (files changed since last run), use `/graphify . --update` to re-extract only changed files.
+
+Skip graphify only for: trivial one-liner edits where the target file and line are already known.
+
+---
+
 ## Rules (12)
 
 ### 1 — Think before coding
