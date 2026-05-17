@@ -105,6 +105,89 @@ def _broadcast(event_type: str, data: dict) -> None:
 _executor    = ThreadPoolExecutor(max_workers=1, thread_name_prefix="monitor")
 _bt_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="backtest")
 
+# ── Price data cache (backtest) ────────────────────────────────────────────────
+# Always downloads the maximum window (10yr + warmup) on first run so that
+# any subsequent parameter change is instant — no re-download needed.
+# Expires after 23h so you get fresh data the next trading day.
+_BT_CACHE_YEARS   = 10     # maximum lookback to cache
+_BT_CACHE_WARMUP  = 520    # calendar days of warmup (covers 200d MA + buffer)
+_BT_CACHE_TTL_HRS = 23
+_bt_price_cache: dict = {}  # {ticker: {"df": DataFrame, "fetched_at": datetime}}
+
+
+def _parse_yf(raw: "pd.DataFrame") -> "pd.DataFrame":
+    """Normalise a raw yfinance DataFrame into a clean OHLCV frame."""
+    if isinstance(raw.columns, pd.MultiIndex):
+        raw.columns = raw.columns.get_level_values(0)
+    df = raw[["Open", "High", "Low", "Close", "Volume"]].copy()
+    df.index = pd.to_datetime(df.index)
+    df.index.name = "Date"
+    df.sort_index(inplace=True)
+    df.dropna(how="all", inplace=True)
+    return df
+
+
+def _get_bt_data(ticker: str) -> pd.DataFrame:
+    """Return OHLCV for ticker with a two-tier caching strategy:
+
+    - First call: downloads the full 10yr + warmup window and caches it.
+    - Subsequent calls within TTL: returns the cache as-is (instant).
+    - Stale cache (next day): downloads only the delta since the last cached
+      date and appends it — avoids re-downloading years of unchanged history.
+    - "Refresh Data" button: clears _bt_price_cache, forcing a full re-download.
+    """
+    end_dt = datetime.now()
+    cached = _bt_price_cache.get(ticker)
+
+    if cached:
+        age_hrs = (end_dt - cached["fetched_at"]).total_seconds() / 3600
+        if age_hrs < _BT_CACHE_TTL_HRS:
+            return cached["df"]           # still fresh — nothing to do
+
+        # Stale: fetch only the delta since the last row we have
+        delta_start = cached["df"].index[-1] + timedelta(days=1)
+        if delta_start.date() >= end_dt.date():
+            # No new trading days possible yet — just refresh the timestamp
+            _bt_price_cache[ticker]["fetched_at"] = end_dt
+            return cached["df"]
+        try:
+            raw = yf.download(
+                ticker,
+                start=delta_start.strftime("%Y-%m-%d"),
+                end=(end_dt + timedelta(days=1)).strftime("%Y-%m-%d"),
+                auto_adjust=True, progress=False,
+            )
+        except Exception:
+            _bt_price_cache[ticker]["fetched_at"] = end_dt  # don't retry every call
+            return cached["df"]
+        if raw.empty:
+            # Weekend / holiday — no new rows
+            _bt_price_cache[ticker]["fetched_at"] = end_dt
+            return cached["df"]
+        new_df = _parse_yf(raw)
+        merged = pd.concat([cached["df"], new_df])
+        merged = merged[~merged.index.duplicated(keep="last")]
+        merged.sort_index(inplace=True)
+        _bt_price_cache[ticker] = {"df": merged, "fetched_at": end_dt}
+        return merged
+
+    # No cache at all — download the full window
+    start_dt = end_dt - timedelta(days=_BT_CACHE_YEARS * 365 + _BT_CACHE_WARMUP)
+    try:
+        raw = yf.download(
+            ticker,
+            start=start_dt.strftime("%Y-%m-%d"),
+            end=(end_dt + timedelta(days=1)).strftime("%Y-%m-%d"),
+            auto_adjust=True, progress=False,
+        )
+    except Exception:
+        return pd.DataFrame()
+    if raw.empty:
+        return pd.DataFrame()
+    df = _parse_yf(raw)
+    _bt_price_cache[ticker] = {"df": df, "fetched_at": end_dt}
+    return df
+
 
 def _run_monitor_sync() -> dict:
     """Execute one full monitor cycle; returns summary dict."""
@@ -202,33 +285,16 @@ def _run_backtest_sync(years: int = 10, min_signals: int = 2, trend_ma: int = 0)
         trend_ma:    if >0, skip events where price disagrees with the N-day moving average
                      (bullish only when close > MA; bearish only when close < MA)
     """
-    end_dt   = datetime.now()
-    warmup   = max(150, trend_ma + 20)  # need enough history to compute the MA
-    start_dt = end_dt - timedelta(days=years * 365 + warmup)
+    end_dt = datetime.now()
 
     events: list = []
     summary: dict = {}
 
     for metal, cfg in METALS.items():
         ticker = cfg["primary"]
-        try:
-            raw = yf.download(
-                ticker,
-                start=start_dt.strftime("%Y-%m-%d"),
-                end=(end_dt + timedelta(days=1)).strftime("%Y-%m-%d"),
-                auto_adjust=True, progress=False,
-            )
-        except Exception:
+        df = _get_bt_data(ticker)
+        if df.empty:
             continue
-        if raw.empty:
-            continue
-        if isinstance(raw.columns, pd.MultiIndex):
-            raw.columns = raw.columns.get_level_values(0)
-        df = raw[["Open", "High", "Low", "Close", "Volume"]].copy()
-        df.index = pd.to_datetime(df.index)
-        df.index.name = "Date"
-        df.sort_index(inplace=True)
-        df.dropna(how="all", inplace=True)
 
         try:
             metrics = compute_metrics(df)
@@ -499,6 +565,31 @@ async def api_backtest() -> JSONResponse:
         "running": _cache["backtest_running"],
         "data":    _cache["backtest"],
     })
+
+
+@app.get("/api/backtest/cache")
+async def api_backtest_cache_status() -> JSONResponse:
+    """Return what price data is currently held in the in-memory cache."""
+    info = {}
+    for ticker, entry in _bt_price_cache.items():
+        df = entry["df"]
+        info[ticker] = {
+            "rows":       len(df),
+            "first_date": df.index[0].strftime("%Y-%m-%d")  if not df.empty else None,
+            "last_date":  df.index[-1].strftime("%Y-%m-%d") if not df.empty else None,
+            "fetched_at": entry["fetched_at"].strftime("%Y-%m-%d %H:%M"),
+            "age_hrs":    round((datetime.now() - entry["fetched_at"]).total_seconds() / 3600, 1),
+        }
+    return JSONResponse({"cached": info})
+
+
+@app.post("/api/backtest/clear-cache")
+async def api_backtest_clear_cache() -> JSONResponse:
+    """Evict the in-memory OHLCV cache so the next Run Backtest re-downloads fresh data."""
+    if _cache["backtest_running"]:
+        raise HTTPException(status_code=409, detail="Backtest running — wait until complete")
+    _bt_price_cache.clear()
+    return JSONResponse({"status": "cleared"})
 
 
 @app.post("/api/backtest/run")
@@ -1052,10 +1143,12 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
     <div class="bt-param bt-param-run">
       <button class="hdr-btn" id="bt-run-btn" onclick="triggerBacktest()">Run Backtest</button>
+      <button class="hdr-btn" id="bt-clear-btn" onclick="clearBtCache()" style="font-size:var(--font-size-2xs);opacity:0.7" title="Force re-download of price data">Refresh Data</button>
     </div>
   </div>
   <div class="bt-header">
     <span class="bt-status" id="bt-status">Configure parameters above, then click Run Backtest</span>
+    <span id="bt-cache-status" style="font-size:var(--font-size-2xs);color:var(--muted)"></span>
   </div>
   <div class="bt-summary-grid" id="bt-summary-grid"></div>
 
@@ -1434,6 +1527,31 @@ function _btParamLabel(p) {
   return p.years + "yr | min " + p.min_signals + " signals" + ma;
 }
 
+async function clearBtCache() {
+  const btn = document.getElementById("bt-clear-btn");
+  btn.disabled = true;
+  btn.textContent = "Clearing…";
+  try {
+    await fetch("/api/backtest/clear-cache", { method: "POST" });
+    document.getElementById("bt-cache-status").textContent = "";
+    document.getElementById("bt-status").textContent = "Data cache cleared — next run will re-download all history";
+  } catch(_) {}
+  btn.disabled = false;
+  btn.textContent = "Refresh Data";
+}
+
+async function refreshBtCacheStatus() {
+  try {
+    const r = await fetch("/api/backtest/cache");
+    const d = await r.json();
+    const tickers = Object.keys(d.cached || {});
+    if (!tickers.length) { document.getElementById("bt-cache-status").textContent = ""; return; }
+    const t = d.cached[tickers[0]];
+    const el = document.getElementById("bt-cache-status");
+    el.textContent = "Cached: " + t.first_date + " → " + t.last_date + " (" + t.age_hrs + "h ago)";
+  } catch(_) {}
+}
+
 async function triggerBacktest() {
   const years    = parseInt(document.getElementById("bt-years").value);
   const minSigs  = parseInt(document.getElementById("bt-minsig").value);
@@ -1476,6 +1594,7 @@ async function triggerBacktest() {
         renderBtSignalStats(d.data.signal_stats || []);
         renderBtSummary(d.data.summary);
         renderBtEvents(d.data.events);
+        refreshBtCacheStatus();
       } else if (Date.now() > deadline) {
         clearInterval(poll);
         btn.disabled       = false;
@@ -1768,6 +1887,7 @@ function renderBtSignalStats(signalStats) {
       renderBtSummary(bd.data.summary);
       renderBtEvents(bd.data.events);
     }
+    refreshBtCacheStatus();
   } catch(_) {}
 })();
 setInterval(refreshAll, 60_000);
