@@ -189,7 +189,7 @@ async def _scheduler_loop() -> None:
 # BACKTEST  (runs in separate thread pool — never blocks the event loop)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _run_backtest_sync(years: int = 3) -> dict:
+def _run_backtest_sync(years: int = 10) -> dict:
     """Download {years} years of OHLCV per metal; detect cluster events; return forward returns.
 
     Uses the same compute_metrics / generate_signals logic as the live monitor so
@@ -341,7 +341,7 @@ async def _run_backtest_async() -> None:
         result = await loop.run_in_executor(_bt_executor, _run_backtest_sync)
         _cache["backtest"] = result
     except Exception as exc:
-        _cache["backtest"] = {"error": str(exc), "events": [], "summary": {}, "years": 3}
+        _cache["backtest"] = {"error": str(exc), "events": [], "summary": {}, "years": 10}
     finally:
         _cache["backtest_running"] = False
 
@@ -958,7 +958,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     <div id="log-box">Loading logs…</div>
   </div>
 
-  <div class="section-title">3-Year Backtest</div>
+  <div class="section-title">10-Year Backtest</div>
   <div class="bt-header">
     <span class="bt-status" id="bt-status">No backtest data — click Run Backtest</span>
     <button class="hdr-btn" id="bt-run-btn" onclick="triggerBacktest()">Run Backtest</button>
@@ -992,7 +992,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
         <th>1d%</th><th>3d%</th><th>5d%</th><th>10d%</th><th>20d%</th>
       </tr></thead>
       <tbody id="bt-events-body">
-        <tr><td colspan="10" class="no-data" style="padding:12px 10px">No backtest data yet — click Run Backtest (~30–60s)</td></tr>
+        <tr><td colspan="10" class="no-data" style="padding:12px 10px">No backtest data yet — click Run Backtest (~60–120s)</td></tr>
       </tbody>
     </table>
   </div>
@@ -1340,7 +1340,7 @@ async function triggerBacktest() {
   const status = document.getElementById("bt-status");
   btn.disabled       = true;
   btn.textContent    = "Running…";
-  status.textContent = "Downloading 3 years of data per metal (~30–60s)…";
+  status.textContent = "Downloading 10 years of data per metal (~60–120s)…";
 
   try {
     const resp = await fetch("/api/backtest/run", { method: "POST" });
@@ -1353,7 +1353,7 @@ async function triggerBacktest() {
     return;
   }
 
-  const deadline = Date.now() + 300_000;
+  const deadline = Date.now() + 600_000;  // 10 min for 10yr download
   const poll = setInterval(async () => {
     try {
       const r = await fetch("/api/backtest");
@@ -1363,7 +1363,7 @@ async function triggerBacktest() {
         btn.disabled       = false;
         btn.textContent    = "Run Backtest";
         const n = (d.data.events || []).length;
-        status.textContent = "Complete — " + n + " cluster events in 3yr window";
+        status.textContent = "Complete — " + n + " cluster events in 10yr window";
         _btData = d.data;
         renderBtChart(d.data.summary);
         renderBtSignalStats(d.data.signal_stats || []);
@@ -1402,7 +1402,7 @@ function renderBtSummary(summary) {
           "<span style='color:var(--" + cls + ")'>" + escHtml(s.metal) + "</span>" +
           "<span class='pill " + dirCls + "' style='margin-left:6px'>" + dirLbl + "</span>" +
         "</div>" +
-        "<div class='bt-stat'><span class='bt-stat-label'>Events (3yr)</span>" +
+        "<div class='bt-stat'><span class='bt-stat-label'>Events (10yr)</span>" +
           "<span class='bt-stat-val'>" + s.count + "</span></div>" +
         "<div class='bt-stat'><span class='bt-stat-label'>Win rate 5d</span>" +
           "<span class='bt-stat-val'>" + fmt(s.win_rate_5d, false) + "</span></div>" +
@@ -1649,7 +1649,7 @@ function renderBtSignalStats(signalStats) {
     if (bd.data && bd.data.events) {
       const n = bd.data.events.length;
       document.getElementById("bt-status").textContent =
-        "Complete — " + n + " cluster events in 3yr window";
+        "Complete — " + n + " cluster events in 10yr window";
       _btData = bd.data;
       renderBtChart(bd.data.summary);
       renderBtSignalStats(bd.data.signal_stats || []);
