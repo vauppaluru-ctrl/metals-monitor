@@ -273,17 +273,12 @@ async def _scheduler_loop() -> None:
 # BACKTEST  (runs in separate thread pool — never blocks the event loop)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _run_backtest_sync(years: int = 10, min_signals: int = 2, trend_ma: int = 0) -> dict:
+def _run_backtest_sync(years: int = 10) -> dict:
     """Download {years} years of OHLCV per metal; detect cluster events; return forward returns.
 
-    Uses the same compute_metrics / generate_signals logic as the live monitor so
-    signal definitions stay in sync.  No state.json writes — read-only.
-
-    Args:
-        years:       number of years of history to analyse
-        min_signals: minimum aligned signals required to count as a cluster event (2–4)
-        trend_ma:    if >0, skip events where price disagrees with the N-day moving average
-                     (bullish only when close > MA; bearish only when close < MA)
+    Always runs with min_signals=2 and no trend filter so the full event set is
+    returned.  ma_50 / ma_100 / ma_200 are embedded in every event so the client
+    can apply any combination of filters instantly without a server round-trip.
     """
     end_dt = datetime.now()
 
@@ -313,32 +308,25 @@ def _run_backtest_sync(years: int = 10, min_signals: int = 2, trend_ma: int = 0)
         if window.empty:
             continue
 
-        # Pre-compute MA column for trend filter (aligned by date)
-        if trend_ma > 0:
-            ma_series = df["Close"].rolling(trend_ma).mean()
-            window = window.copy()
-            window["_ma"] = window["Date"].map(ma_series)
+        # Pre-compute MA columns for all three horizons — embedded in every event
+        # so the client can apply the trend filter instantly without a server call.
+        window = window.copy()
+        for _n in (50, 100, 200):
+            window[f"_ma{_n}"] = window["Date"].map(df["Close"].rolling(_n).mean())
+
+        def _ma_val(row: "pd.Series", n: int) -> "float | None":
+            v = row.get(f"_ma{n}")
+            return round(float(v), 2) if pd.notna(v) else None
 
         last_i = -999  # positional index of the last event (3-trading-day cooldown)
         for i, row in window.iterrows():
             n_bull = sum(1 for c in SIGNAL_COLS if row[c] == "bullish")
             n_bear = sum(1 for c in SIGNAL_COLS if row[c] == "bearish")
-            if n_bull < min_signals and n_bear < min_signals:
+            if n_bull < 2 and n_bear < 2:
                 continue
             direction = "bullish" if n_bull >= n_bear else "bearish"
             if i - last_i < 3:  # positional cooldown (3 trading days)
                 continue
-
-            # Trend filter: skip if price disagrees with the MA direction
-            if trend_ma > 0:
-                ma_val = row.get("_ma")
-                if pd.isna(ma_val):
-                    continue
-                if direction == "bullish" and float(row["Close"]) <= float(ma_val):
-                    continue
-                if direction == "bearish" and float(row["Close"]) >= float(ma_val):
-                    continue
-
             last_i = i
 
             close = float(row["Close"])
@@ -359,6 +347,9 @@ def _run_backtest_sync(years: int = 10, min_signals: int = 2, trend_ma: int = 0)
                 "n_signals":  n_bull if direction == "bullish" else n_bear,
                 "categories": [c for c in SIGNAL_COLS if row[c] == direction],
                 "close":      round(close, 2),
+                "ma_50":      _ma_val(row, 50),
+                "ma_100":     _ma_val(row, 100),
+                "ma_200":     _ma_val(row, 200),
                 **fwd,
             })
 
@@ -421,20 +412,18 @@ def _run_backtest_sync(years: int = 10, min_signals: int = 2, trend_ma: int = 0)
         })
     signal_stats.sort(key=lambda x: (x["metal"], x["direction"], x["signal"]))
 
-    params = {"years": years, "min_signals": min_signals, "trend_ma": trend_ma}
-    return {"events": events, "summary": summary, "signal_stats": signal_stats, "years": years, "params": params}
+    return {"events": events, "summary": summary, "signal_stats": signal_stats, "years": years}
 
 
-async def _run_backtest_async(years: int = 10, min_signals: int = 2, trend_ma: int = 0) -> None:
+async def _run_backtest_async(years: int = 10) -> None:
     loop = asyncio.get_running_loop()
     _cache["backtest_running"] = True
     try:
-        fn = functools.partial(_run_backtest_sync, years=years, min_signals=min_signals, trend_ma=trend_ma)
+        fn = functools.partial(_run_backtest_sync, years=years)
         result = await loop.run_in_executor(_bt_executor, fn)
         _cache["backtest"] = result
     except Exception as exc:
-        _cache["backtest"] = {"error": str(exc), "events": [], "summary": {}, "years": years,
-                              "params": {"years": years, "min_signals": min_signals, "trend_ma": trend_ma}}
+        _cache["backtest"] = {"error": str(exc), "events": [], "summary": {}, "years": years}
     finally:
         _cache["backtest_running"] = False
 
@@ -601,10 +590,8 @@ async def api_backtest_run(request: Request) -> JSONResponse:
         body = await request.json()
     except Exception:
         pass
-    years       = max(1,  min(20,  int(body.get("years",       10))))
-    min_signals = max(2,  min(4,   int(body.get("min_signals", 2))))
-    trend_ma    = max(0,  min(500, int(body.get("trend_ma",    0))))
-    asyncio.create_task(_run_backtest_async(years=years, min_signals=min_signals, trend_ma=trend_ma))
+    years = max(1, min(20, int(body.get("years", 10))))
+    asyncio.create_task(_run_backtest_async(years=years))
     return JSONResponse({"status": "started"})
 
 
@@ -1125,16 +1112,16 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="bt-param">
       <label>Data window: <strong id="bt-years-val">10</strong> yr</label>
       <input type="range" id="bt-years" min="3" max="10" step="1" value="10"
-             oninput="document.getElementById('bt-years-val').textContent=this.value">
+             oninput="document.getElementById('bt-years-val').textContent=this.value; scheduleBtFilter()">
     </div>
     <div class="bt-param">
       <label>Min signals: <strong id="bt-minsig-val">2</strong> of 4</label>
       <input type="range" id="bt-minsig" min="2" max="4" step="1" value="2"
-             oninput="document.getElementById('bt-minsig-val').textContent=this.value">
+             oninput="document.getElementById('bt-minsig-val').textContent=this.value; scheduleBtFilter()">
     </div>
     <div class="bt-param">
       <label>Trend filter (price vs MA)</label>
-      <select id="bt-trendma">
+      <select id="bt-trendma" onchange="scheduleBtFilter()">
         <option value="0">None — take all signals</option>
         <option value="50">50-day MA</option>
         <option value="100">100-day MA</option>
@@ -1195,7 +1182,8 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
 "use strict";
 
 // ── Theme ─────────────────────────────────────────────────────────────────────
-let _btData = null;  // hoisted before applyTheme IIFE to avoid TDZ
+let _btData        = null;  // hoisted before applyTheme IIFE to avoid TDZ
+let _btFilterTimer = null;  // debounce handle for slider changes
 // Single function that owns ALL theme state. Everything else calls applyTheme().
 function applyTheme(theme) {
   document.documentElement.setAttribute("data-theme", theme);
@@ -1590,10 +1578,7 @@ async function triggerBacktest() {
         const p = d.data.params || {years, min_signals: minSigs, trend_ma: trendMa};
         status.textContent = "Complete — " + n + " events | " + _btParamLabel(p);
         _btData = d.data;
-        renderBtChart(d.data.summary);
-        renderBtSignalStats(d.data.signal_stats || []);
-        renderBtSummary(d.data.summary);
-        renderBtEvents(d.data.events);
+        applyBtFilters();
         refreshBtCacheStatus();
       } else if (Date.now() > deadline) {
         clearInterval(poll);
@@ -1666,6 +1651,96 @@ function renderBtEvents(events) {
       "</tr>";
   }
   tbody.innerHTML = html;
+}
+
+// ── Client-side backtest filtering ───────────────────────────────────────────
+// All three sliders filter _btData.events in JS — no server round-trip needed.
+
+function scheduleBtFilter() {
+  clearTimeout(_btFilterTimer);
+  _btFilterTimer = setTimeout(applyBtFilters, 280);
+}
+
+function applyBtFilters() {
+  if (!_btData || !_btData.events) return;
+  const years   = parseInt(document.getElementById("bt-years").value);
+  const minSigs = parseInt(document.getElementById("bt-minsig").value);
+  const trendMa = parseInt(document.getElementById("bt-trendma").value);
+
+  const cutoff = new Date();
+  cutoff.setFullYear(cutoff.getFullYear() - years);
+  const cutoffStr = cutoff.toISOString().slice(0, 10);
+
+  const events = (_btData.events || []).filter(ev => {
+    if (ev.date < cutoffStr) return false;
+    if (ev.n_signals < minSigs) return false;
+    if (trendMa > 0) {
+      const ma = ev["ma_" + trendMa];
+      if (ma == null) return false;
+      if (ev.direction === "bullish" && ev.close <= ma) return false;
+      if (ev.direction === "bearish" && ev.close >= ma) return false;
+    }
+    return true;
+  });
+
+  const summary     = computeBtSummary(events);
+  const signalStats = computeBtSignalStats(events);
+  const p = {years, min_signals: minSigs, trend_ma: trendMa};
+  document.getElementById("bt-status").textContent =
+    "Complete — " + events.length + " events | " + _btParamLabel(p);
+
+  renderBtChart(summary);
+  renderBtSignalStats(signalStats);
+  renderBtSummary(summary);
+  renderBtEvents(events);
+}
+
+function computeBtSummary(events) {
+  const summary = {};
+  for (const metal of ["Gold", "Silver", "Copper"]) {
+    for (const dir of ["bullish", "bearish"]) {
+      const evs = events.filter(e => e.metal === metal && e.direction === dir);
+      if (!evs.length) continue;
+      const s = {metal, direction: dir, count: evs.length};
+      for (const days of [5, 10]) {
+        const rets = evs.map(e => e["fwd_" + days + "d"]).filter(r => r != null);
+        if (rets.length) {
+          const wins = rets.filter(r => dir === "bullish" ? r > 0 : r < 0);
+          s["win_rate_" + days + "d"] = Math.round(wins.length / rets.length * 1000) / 10;
+          s["avg_ret_" + days + "d"]  = Math.round(rets.reduce((a, b) => a + b, 0) / rets.length * 100) / 100;
+        } else {
+          s["win_rate_" + days + "d"] = null;
+          s["avg_ret_" + days + "d"]  = null;
+        }
+      }
+      summary[metal + "_" + dir] = s;
+    }
+  }
+  return summary;
+}
+
+function computeBtSignalStats(events) {
+  const perf = {};
+  for (const ev of events) {
+    for (const cat of (ev.categories || [])) {
+      const key = ev.metal + "|" + ev.direction + "|" + cat;
+      if (!perf[key]) perf[key] = {metal: ev.metal, direction: ev.direction, signal: cat, count: 0, r5: [], r10: []};
+      perf[key].count++;
+      if (ev.fwd_5d  != null) perf[key].r5.push(ev.fwd_5d);
+      if (ev.fwd_10d != null) perf[key].r10.push(ev.fwd_10d);
+    }
+  }
+  const wr  = (rets, dir) => {
+    if (!rets.length) return null;
+    const wins = rets.filter(r => dir === "bullish" ? r > 0 : r < 0);
+    return Math.round(wins.length / rets.length * 1000) / 10;
+  };
+  const avg = arr => arr.length ? Math.round(arr.reduce((a, b) => a + b, 0) / arr.length * 100) / 100 : null;
+  return Object.values(perf).map(p => ({
+    metal:        p.metal, direction: p.direction, signal: p.signal, count: p.count,
+    win_rate_5d:  wr(p.r5,  p.direction), avg_ret_5d:  avg(p.r5),
+    win_rate_10d: wr(p.r10, p.direction), avg_ret_10d: avg(p.r10),
+  })).sort((a, b) => (a.metal + a.direction + a.signal).localeCompare(b.metal + b.direction + b.signal));
 }
 
 // ── Backtest chart (Canvas 2D) ────────────────────────────────────────────────
@@ -1874,18 +1949,9 @@ function renderBtSignalStats(signalStats) {
     const bd = await br.json();
     if (bd.data && bd.data.events) {
       const n = bd.data.events.length;
-      const p = bd.data.params || {};
-      // Sync sliders to the params used in the cached run
-      if (p.years)       { document.getElementById("bt-years").value  = p.years;       document.getElementById("bt-years-val").textContent  = p.years; }
-      if (p.min_signals) { document.getElementById("bt-minsig").value = p.min_signals; document.getElementById("bt-minsig-val").textContent = p.min_signals; }
-      if (p.trend_ma != null) document.getElementById("bt-trendma").value = p.trend_ma;
-      document.getElementById("bt-status").textContent =
-        "Complete — " + n + " events | " + _btParamLabel(p);
+      // status text set by applyBtFilters() below
       _btData = bd.data;
-      renderBtChart(bd.data.summary);
-      renderBtSignalStats(bd.data.signal_stats || []);
-      renderBtSummary(bd.data.summary);
-      renderBtEvents(bd.data.events);
+      applyBtFilters();
     }
     refreshBtCacheStatus();
   } catch(_) {}
