@@ -918,6 +918,61 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   .fwd-neg { color: var(--bear); font-weight: 700; }
   .fwd-nil { color: var(--muted); }
 
+  /* ── Metal Outlook cards ────────────────────────────────────── */
+  .outlook-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
+    gap: 14px;
+    margin-bottom: 24px;
+  }
+  .outlook-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-left: 4px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding: 16px;
+  }
+  .outlook-card.bull { border-left-color: var(--bull); }
+  .outlook-card.bear { border-left-color: var(--bear); }
+  .outlook-headline {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+    font-size: var(--font-size-md);
+    font-weight: 700;
+  }
+  .outlook-narrative {
+    font-size: var(--font-size-sm);
+    line-height: 1.65;
+    margin-bottom: 8px;
+  }
+  .outlook-history {
+    font-size: var(--font-size-xs);
+    color: var(--muted);
+    line-height: 1.55;
+    margin-bottom: 8px;
+    padding: 7px 10px;
+    background: var(--bg);
+    border-radius: var(--radius);
+    border-left: 2px solid var(--accent);
+  }
+  .outlook-ctx {
+    font-size: var(--font-size-2xs);
+    color: var(--muted);
+    margin-bottom: 9px;
+    letter-spacing: .2px;
+  }
+  .outlook-action {
+    font-size: var(--font-size-xs);
+    line-height: 1.6;
+    padding-top: 9px;
+    border-top: 1px solid var(--border);
+  }
+  .outlook-action.act-strong { color: var(--bull); }
+  .outlook-action.act-bear   { color: var(--bear); }
+  .outlook-action.act-watch  { color: var(--muted); }
+
   /* ── Info icon & signal explanation popup ───────────────────── */
   .info-icon {
     display: inline-flex;
@@ -1079,6 +1134,11 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="no-data">Waiting for first run…</div>
   </div>
 
+  <div class="section-title">Metal Outlook</div>
+  <div class="outlook-grid" id="outlook-grid">
+    <div class="no-data">Run the monitor to see metal outlooks</div>
+  </div>
+
   <div class="section-title">Recent Alerts</div>
   <table id="events-table">
     <thead><tr>
@@ -1217,8 +1277,10 @@ function escHtml(s) {
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
-let _newsData = {};
+let _newsData        = {};
 let _activeNewsMetal = "Gold";
+let _metalsData      = {};   // latest /api/metals payload
+let _activeBtSummary = null; // filtered backtest summary (set by applyBtFilters)
 
 // ── SSE ───────────────────────────────────────────────────────────────────────
 const es = new EventSource("/stream");
@@ -1262,7 +1324,9 @@ async function refreshMetals() {
       document.getElementById("last-run").textContent =
         "Last run: " + escHtml(d.last_run);
     }
-    renderMetals(d.metals || {});
+    _metalsData = d.metals || {};
+    renderMetals(_metalsData);
+    renderOutlook();
   } catch(e) { console.error("metals fetch", e); }
 }
 
@@ -1653,6 +1717,148 @@ function renderBtEvents(events) {
   tbody.innerHTML = html;
 }
 
+// ── Metal Outlook ─────────────────────────────────────────────────────────────
+
+function renderOutlook() {
+  const grid = document.getElementById("outlook-grid");
+  if (!grid) return;
+  grid.textContent = "";
+  const metals = ["Gold", "Silver", "Copper"];
+  if (!metals.some(m => _metalsData[m])) {
+    const d = document.createElement("div");
+    d.className = "no-data";
+    d.textContent = "Run the monitor to see metal outlooks";
+    grid.appendChild(d);
+    return;
+  }
+  for (const metal of metals) {
+    if (_metalsData[metal]) grid.appendChild(buildOutlookCard(metal, _metalsData[metal]));
+  }
+}
+
+function buildOutlookCard(metal, data) {
+  // ── helpers ──────────────────────────────────────────────────────────────
+  function mk(tag, cls, txt) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (txt != null) e.textContent = txt;
+    return e;
+  }
+  function app(parent) {
+    for (let i = 1; i < arguments.length; i++) if (arguments[i]) parent.appendChild(arguments[i]);
+    return parent;
+  }
+
+  // ── signal state ─────────────────────────────────────────────────────────
+  const TRIGGER_KEYS = [
+    "futures_curve_proxy", "etf_pressure_proxy",
+    "physical_tightness_proxy", "demand_expectations_proxy",
+  ];
+  const sigs    = data.all_signals || {};
+  const ctx     = data.context_signals || {};
+  const nBull   = data.n_bullish || 0;
+  const nBear   = data.n_bearish || 0;
+  const dir     = nBull >= 2 ? "bullish" : nBear >= 2 ? "bearish" : "neutral";
+  const n       = dir === "bullish" ? nBull : dir === "bearish" ? nBear : 0;
+  const mc      = metal.toLowerCase();
+
+  // fired signal labels for narrative
+  const firedLabels = TRIGGER_KEYS
+    .filter(k => sigs[k] === dir && dir !== "neutral")
+    .map(k => (SIG_INFO[k] || {}).label || k.replace(/_proxy$/, "").replace(/_/g, " "));
+
+  // ── backtest stats for this metal + direction ─────────────────────────────
+  const btKey = metal + "_" + dir;
+  const bt    = (_activeBtSummary && dir !== "neutral") ? (_activeBtSummary[btKey] || null) : null;
+  const wr10  = bt ? bt.win_rate_10d : null;
+  const avg10 = bt ? bt.avg_ret_10d  : null;
+  const btCnt = bt ? bt.count        : 0;
+
+  // ── card ─────────────────────────────────────────────────────────────────
+  const card = mk("div", "outlook-card " + (dir === "bullish" ? "bull" : dir === "bearish" ? "bear" : ""));
+
+  // Headline
+  const headline = mk("div", "outlook-headline");
+  const nameEl   = mk("span", "", metal);
+  nameEl.style.color = "var(--" + mc + ")";
+  const arrow    = dir === "bullish" ? "▲" : dir === "bearish" ? "▼" : "─";
+  const dirPill  = mk("span", "pill " + (dir === "bullish" ? "bull" : dir === "bearish" ? "bear" : ""), arrow + " " + (dir === "neutral" ? "Mixed" : dir.charAt(0).toUpperCase() + dir.slice(1)));
+  app(headline, nameEl, dirPill);
+  card.appendChild(headline);
+
+  // Narrative paragraph
+  const narr = mk("p", "outlook-narrative");
+  if (dir !== "neutral") {
+    const joined = firedLabels.length > 1
+      ? firedLabels.slice(0, -1).join(", ") + " and " + firedLabels[firedLabels.length - 1]
+      : (firedLabels[0] || "");
+    narr.textContent = "Right now " + n + " of 4 indicators are showing " + dir + " pressure on " + metal + ": " + joined + ".";
+  } else {
+    const nearDir = nBull > nBear ? "bullish" : nBear > nBull ? "bearish" : null;
+    const nearN   = Math.max(nBull, nBear);
+    narr.textContent = "Signals on " + metal + " are mixed — " + nBull + " bullish, " + nBear + " bearish, " + (4 - nBull - nBear) + " neutral. No cluster alert.";
+    if (nearDir && nearN === 1) {
+      const hint = mk("span", "", " One more " + nearDir + " signal would trigger an alert.");
+      hint.style.color = "var(--muted)";
+      narr.appendChild(hint);
+    }
+  }
+  card.appendChild(narr);
+
+  // Historical stats block
+  if (bt && btCnt >= 3 && wr10 != null && avg10 != null) {
+    const hist = mk("div", "outlook-history");
+    const avgStr = (avg10 >= 0 ? "+" : "") + avg10 + "%";
+    const conf   = btCnt < 12 ? " (" + btCnt + " events — limited sample)" : " (" + btCnt + " events, 10yr)";
+    hist.textContent = "Historically when " + n + "+ signals aligned " + dir + " on " + metal + ", price moved " + avgStr + " on average over 10 days — " + wr10 + "% win rate" + conf + ".";
+    card.appendChild(hist);
+  } else if (dir !== "neutral" && !_activeBtSummary) {
+    const hint = mk("div", "outlook-history");
+    hint.textContent = "Run the 10-year backtest below to see historical win rates for this setup.";
+    card.appendChild(hint);
+  }
+
+  // Context signals
+  const ctxLines = [];
+  const CTX_LABELS = {
+    dollar_trend:      { bullish: "Dollar weakening ✓",     bearish: "Dollar strengthening ✗" },
+    vix_regime:        { bullish: "VIX elevated/rising ✓",  bearish: "VIX low/falling" },
+    cross_metal_ratio: { bullish: "Cross-ratio bullish ✓",  bearish: "Cross-ratio bearish ✗" },
+  };
+  for (const [k, v] of Object.entries(ctx)) {
+    if (v !== "neutral" && CTX_LABELS[k] && CTX_LABELS[k][v]) ctxLines.push(CTX_LABELS[k][v]);
+  }
+  if (ctxLines.length) card.appendChild(mk("div", "outlook-ctx", "Context: " + ctxLines.join("  ·  ")));
+
+  // Action guidance
+  if (dir !== "neutral") {
+    const action = mk("div", "outlook-action");
+    if (dir === "bullish") {
+      if (wr10 != null && wr10 >= 60 && btCnt >= 10) {
+        action.className += " act-strong";
+        action.textContent = "▶ Above-average setup. Historical win rate exceeds 60% for this configuration. If you hold " + metal + " exposure, the data supports staying in or adding. If not, this is worth watching closely.";
+      } else if (n >= 3) {
+        action.className += " act-watch";
+        action.textContent = "▶ 3+ signals aligned. Multi-signal agreement is meaningful even when historical data is limited. Worth reviewing your " + metal + " exposure.";
+      } else {
+        action.className += " act-watch";
+        action.textContent = "▶ Minimum cluster met. Modest setup — use this as a prompt to review rather than act immediately.";
+      }
+    } else {
+      if (wr10 != null && wr10 >= 55 && btCnt >= 10) {
+        action.className += " act-bear";
+        action.textContent = "▶ Bearish cluster with meaningful historical accuracy. If you hold " + metal + " exposure, review whether your position size matches your risk tolerance.";
+      } else {
+        action.className += " act-watch";
+        action.textContent = "▶ Bearish signals present. Consider whether current " + metal + " exposure is appropriate given the cluster, especially if the broader price trend is also declining.";
+      }
+    }
+    card.appendChild(action);
+  }
+
+  return card;
+}
+
 // ── Client-side backtest filtering ───────────────────────────────────────────
 // All three sliders filter _btData.events in JS — no server round-trip needed.
 
@@ -1685,6 +1891,7 @@ function applyBtFilters() {
 
   const summary     = computeBtSummary(events);
   const signalStats = computeBtSignalStats(events);
+  _activeBtSummary  = summary;
   const p = {years, min_signals: minSigs, trend_ma: trendMa};
   document.getElementById("bt-status").textContent =
     "Complete — " + events.length + " events | " + _btParamLabel(p);
@@ -1693,6 +1900,7 @@ function applyBtFilters() {
   renderBtSignalStats(signalStats);
   renderBtSummary(summary);
   renderBtEvents(events);
+  renderOutlook();
 }
 
 function computeBtSummary(events) {
