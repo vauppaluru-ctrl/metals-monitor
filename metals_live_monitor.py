@@ -158,6 +158,116 @@ def download_ohlcv(ticker: str) -> pd.DataFrame:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# MACRO / CROSS-ASSET CONTEXT DATA
+# ──────────────────────────────────────────────────────────────────────────────
+
+def download_macro_data() -> dict:
+    """Download cross-asset context tickers once per run. Returns a partial dict on any failure."""
+    macro: dict = {}
+    for ticker in ["UUP", "^VIX", "GLD", "SLV", "CPER"]:
+        try:
+            macro[ticker] = download_ohlcv(ticker)
+        except Exception as exc:
+            log.warning(f"  Macro context [{ticker}] unavailable: {exc}")
+    return macro
+
+
+def compute_context_signals(metal: str, macro: dict) -> dict:
+    """
+    Compute 3 cross-asset context signals per metal from shared macro data.
+
+    These are display-only and do NOT affect the cluster trigger threshold —
+    the ≥2 rule operates only on SIGNAL_COLS (the original 4 price-action signals).
+    Returns "neutral" for any signal whose source data is missing or insufficient.
+    """
+    out: dict = {
+        "dollar_trend":      "neutral",
+        "vix_regime":        "neutral",
+        "cross_metal_ratio": "neutral",
+    }
+
+    # ── 1. Dollar trend — UUP 10d momentum (inverted: weak dollar = bullish) ──
+    try:
+        uup = macro.get("UUP")
+        if uup is not None and len(uup) >= 11:
+            uup_10d = float(uup["Close"].pct_change(10).iloc[-1])
+            if not np.isnan(uup_10d):
+                if uup_10d < -0.015:
+                    out["dollar_trend"] = "bullish"   # dollar weakening → metals benefit
+                elif uup_10d > 0.015:
+                    out["dollar_trend"] = "bearish"   # dollar strengthening → metals pressured
+    except Exception as exc:
+        log.debug(f"  dollar_trend signal error ({metal}): {exc}")
+
+    # ── 2. VIX regime — level + 5-day direction ───────────────────────────────
+    try:
+        vix = macro.get("^VIX")
+        if vix is not None and len(vix) >= 6:
+            vix_now  = float(vix["Close"].iloc[-1])
+            vix_rise = vix_now - float(vix["Close"].iloc[-6])
+            if not any(np.isnan(x) for x in [vix_now, vix_rise]):
+                if metal in ("Gold", "Silver"):
+                    if vix_now >= 20 and vix_rise > 0:
+                        out["vix_regime"] = "bullish"  # fear rising → safe-haven demand
+                    elif vix_now < 15 and vix_rise < 0:
+                        out["vix_regime"] = "bearish"  # fear falling → no safe-haven need
+                else:  # Copper: inverted — fear kills industrial demand
+                    if vix_now >= 25 and vix_rise > 0:
+                        out["vix_regime"] = "bearish"  # recession fear → copper demand drops
+                    elif vix_now < 18 and vix_rise < 0:
+                        out["vix_regime"] = "bullish"  # risk-on → industrial demand up
+    except Exception as exc:
+        log.debug(f"  vix_regime signal error ({metal}): {exc}")
+
+    # ── 3. Cross-metal ratio — G/S ratio (Gold/Silver), Cu/Au ratio (Copper) ─
+    try:
+        gld  = macro.get("GLD")
+        slv  = macro.get("SLV")
+        cper = macro.get("CPER")
+
+        if metal == "Silver" and gld is not None and slv is not None:
+            # G/S ratio level: GLD ≈ 0.0927 oz/share, SLV ≈ 0.927 oz/share → factor ≈ 10
+            gld_c = float(gld["Close"].iloc[-1])
+            slv_c = float(slv["Close"].iloc[-1])
+            if slv_c > 0 and not any(np.isnan(x) for x in [gld_c, slv_c]):
+                gs = gld_c * 10.0 / slv_c
+                if gs > 80:
+                    out["cross_metal_ratio"] = "bullish"   # silver historically undervalued
+                elif gs < 50:
+                    out["cross_metal_ratio"] = "bearish"   # silver historically overvalued
+
+        elif metal == "Gold" and gld is not None and slv is not None and len(gld) >= 11 and len(slv) >= 11:
+            gld_now = float(gld["Close"].iloc[-1])
+            slv_now = float(slv["Close"].iloc[-1])
+            gld_10d = float(gld["Close"].iloc[-11])
+            slv_10d = float(slv["Close"].iloc[-11])
+            if all(v > 0 and not np.isnan(v) for v in [gld_now, slv_now, gld_10d, slv_10d]):
+                gs_now = gld_now * 10.0 / slv_now
+                gs_10d = gld_10d * 10.0 / slv_10d
+                gs_mom = (gs_now - gs_10d) / gs_10d
+                if gs_mom > 0.02:
+                    out["cross_metal_ratio"] = "bullish"   # gold outpacing silver → institutional rotation to gold
+                elif gs_mom < -0.02:
+                    out["cross_metal_ratio"] = "bearish"   # silver catching up → risk-on reducing gold premium
+
+        elif metal == "Copper" and cper is not None and gld is not None and len(cper) >= 11 and len(gld) >= 11:
+            cper_now = float(cper["Close"].iloc[-1])
+            gld_now  = float(gld["Close"].iloc[-1])
+            cper_10d = float(cper["Close"].iloc[-11])
+            gld_10d  = float(gld["Close"].iloc[-11])
+            if all(v > 0 and not np.isnan(v) for v in [cper_now, gld_now, cper_10d, gld_10d]):
+                cau_mom = ((cper_now / gld_now) - (cper_10d / gld_10d)) / (cper_10d / gld_10d)
+                if cau_mom > 0.015:
+                    out["cross_metal_ratio"] = "bullish"   # Cu/Au rising → economic growth regime
+                elif cau_mom < -0.015:
+                    out["cross_metal_ratio"] = "bearish"   # Cu/Au falling → risk-off regime
+    except Exception as exc:
+        log.debug(f"  cross_metal_ratio signal error ({metal}): {exc}")
+
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # METRICS  (same logic as backtest)
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -200,6 +310,14 @@ SIGNAL_COLS = [
     "demand_expectations_proxy",
 ]
 
+# Context signals — displayed on the dashboard but do NOT count toward the ≥2 cluster trigger.
+# Each is computed from cross-asset data (UUP, ^VIX, G/S ratio, Cu/Au ratio).
+CONTEXT_SIGNAL_COLS = [
+    "dollar_trend",       # UUP 10d momentum — weak dollar = bullish for all metals
+    "vix_regime",         # VIX level + 5d direction — fear index context
+    "cross_metal_ratio",  # G/S ratio (Silver), G/S momentum (Gold), Cu/Au momentum (Copper)
+]
+
 
 def generate_signals(m: pd.DataFrame) -> pd.DataFrame:
     s = m.copy()
@@ -235,7 +353,7 @@ def generate_signals(m: pd.DataFrame) -> pd.DataFrame:
 # EVALUATE LATEST TRADING DAY
 # ──────────────────────────────────────────────────────────────────────────────
 
-def evaluate_latest(signals_df: pd.DataFrame) -> dict:
+def evaluate_latest(signals_df: pd.DataFrame, context_signals: dict | None = None) -> dict:
     """Return signal summary for the most recent row with valid vol_60d."""
     valid  = signals_df.dropna(subset=["vol_60d"])
     if valid.empty:
@@ -246,14 +364,15 @@ def evaluate_latest(signals_df: pd.DataFrame) -> dict:
     bear_cats = [c for c in SIGNAL_COLS if latest[c] == "bearish"]
 
     return {
-        "date":      latest.name.strftime("%Y-%m-%d"),
-        "close":     float(latest["Close"]),
-        "n_bullish": len(bull_cats),
-        "n_bearish": len(bear_cats),
-        "bull_cats": bull_cats,
-        "bear_cats": bear_cats,
-        "vol_60d":   float(latest["vol_60d"]),
-        "all_signals": {c: latest[c] for c in SIGNAL_COLS},
+        "date":            latest.name.strftime("%Y-%m-%d"),
+        "close":           float(latest["Close"]),
+        "n_bullish":       len(bull_cats),
+        "n_bearish":       len(bear_cats),
+        "bull_cats":       bull_cats,
+        "bear_cats":       bear_cats,
+        "vol_60d":         float(latest["vol_60d"]),
+        "all_signals":     {c: latest[c] for c in SIGNAL_COLS},
+        "context_signals": context_signals or {},
     }
 
 
@@ -474,6 +593,9 @@ def main() -> None:
 
     # Fetch news once per run (not per metal) to avoid hammering the feeds
     sentiment = fetch_news_sentiment(list(METALS.keys()))
+
+    # Download cross-asset macro context once per run (UUP, VIX, metal price ratios)
+    macro_data = download_macro_data()
     if RSS_ENABLED:
         for metal, data in sentiment.items():
             log.info(f"  RSS [{metal}]: {data['n_relevant']} relevant headline(s)  "
@@ -486,10 +608,11 @@ def main() -> None:
         log.info(f"Evaluating {metal} ({ticker}) ...")
 
         try:
-            raw     = download_ohlcv(ticker)
-            metrics = compute_metrics(raw)
-            signals = generate_signals(metrics)
-            result  = evaluate_latest(signals)
+            raw         = download_ohlcv(ticker)
+            metrics     = compute_metrics(raw)
+            signals     = generate_signals(metrics)
+            ctx_signals = compute_context_signals(metal, macro_data)
+            result      = evaluate_latest(signals, ctx_signals)
         except Exception as exc:
             log.error(f"  Failed to evaluate {metal}: {exc}")
             continue
@@ -502,6 +625,8 @@ def main() -> None:
         )
         for sig, val in result["all_signals"].items():
             log.info(f"    {sig:<35} {val}")
+        for sig, val in result.get("context_signals", {}).items():
+            log.info(f"    [ctx] {sig:<31} {val}")
 
         for direction, n_sig, cats in [
             ("bullish", result["n_bullish"], result["bull_cats"]),

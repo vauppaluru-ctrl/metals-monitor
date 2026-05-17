@@ -249,7 +249,7 @@ class TestRunAndData:
         fresh_page.wait_for_timeout(4000)
 
         badges = fresh_page.locator(".sig-val").all()
-        assert len(badges) == 12, f"Expected 12 signal badges (4 per metal × 3), got {len(badges)}"
+        assert len(badges) == 21, f"Expected 21 signal badges (7 per metal × 3: 4 trigger + 3 context), got {len(badges)}"
         valid = {"bullish", "bearish", "neutral"}
         for badge in badges:
             text = badge.inner_text().strip().lower()

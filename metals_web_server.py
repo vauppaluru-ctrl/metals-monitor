@@ -44,6 +44,7 @@ from metals_live_monitor import (
     METALS, STATE_FILE, LOG_FILE,
     load_state, save_state,
     download_ohlcv, compute_metrics, generate_signals, evaluate_latest,
+    download_macro_data, compute_context_signals,
     fetch_news_sentiment, format_news_context,
     build_notification, send_notification,
     record_cooldown, cooldown_allows, _append_recent_event,
@@ -110,15 +111,17 @@ def _run_monitor_sync() -> dict:
     alerts_fired = 0
     metal_results: dict = {}
 
-    sentiment = fetch_news_sentiment(list(METALS.keys()))
+    sentiment  = fetch_news_sentiment(list(METALS.keys()))
+    macro_data = download_macro_data()
 
     for metal, cfg in METALS.items():
         ticker = cfg["primary"]
         try:
-            raw     = download_ohlcv(ticker)
-            metrics = compute_metrics(raw)
-            signals = generate_signals(metrics)
-            result  = evaluate_latest(signals)
+            raw         = download_ohlcv(ticker)
+            metrics     = compute_metrics(raw)
+            signals     = generate_signals(metrics)
+            ctx_signals = compute_context_signals(metal, macro_data)
+            result      = evaluate_latest(signals, ctx_signals)
         except Exception as exc:
             metal_results[metal] = {"error": str(exc)}
             continue
@@ -288,7 +291,47 @@ def _run_backtest_sync(years: int = 3) -> dict:
             summary[f"{metal}_{dir_}"] = s
 
     events.sort(key=lambda e: e["date"], reverse=True)
-    return {"events": events, "summary": summary, "years": years}
+
+    # ── Per-signal accuracy stats ──────────────────────────────────────────────
+    # For each trigger signal category, collect forward returns from every cluster
+    # event in which that signal fired.  Win = price moved in the signalled direction.
+    _sig_perf: dict = {}
+    for ev in events:
+        for cat in (ev.get("categories") or []):
+            key = f"{ev['metal']}|{ev['direction']}|{cat}"
+            if key not in _sig_perf:
+                _sig_perf[key] = {
+                    "metal": ev["metal"], "direction": ev["direction"],
+                    "signal": cat, "count": 0,
+                    "r5": [], "r10": [],
+                }
+            _sig_perf[key]["count"] += 1
+            r5  = ev.get("fwd_5d")
+            r10 = ev.get("fwd_10d")
+            if r5  is not None: _sig_perf[key]["r5"].append(r5)
+            if r10 is not None: _sig_perf[key]["r10"].append(r10)
+
+    def _wr(rets: list, direction: str):
+        if not rets: return None
+        wins = [r for r in rets if (direction == "bullish" and r > 0) or (direction == "bearish" and r < 0)]
+        return round(len(wins) / len(rets) * 100, 1)
+
+    signal_stats = []
+    for s in _sig_perf.values():
+        d, r5, r10 = s["direction"], s["r5"], s["r10"]
+        signal_stats.append({
+            "metal":        s["metal"],
+            "direction":    d,
+            "signal":       s["signal"],
+            "count":        s["count"],
+            "win_rate_5d":  _wr(r5,  d),
+            "avg_ret_5d":   round(sum(r5)  / len(r5),  2) if r5  else None,
+            "win_rate_10d": _wr(r10, d),
+            "avg_ret_10d":  round(sum(r10) / len(r10), 2) if r10 else None,
+        })
+    signal_stats.sort(key=lambda x: (x["metal"], x["direction"], x["signal"]))
+
+    return {"events": events, "summary": summary, "signal_stats": signal_stats, "years": years}
 
 
 async def _run_backtest_async() -> None:
@@ -761,6 +804,115 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   .fwd-pos { color: var(--bull); font-weight: 700; }
   .fwd-neg { color: var(--bear); font-weight: 700; }
   .fwd-nil { color: var(--muted); }
+
+  /* ── Info icon & signal explanation popup ───────────────────── */
+  .info-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 14px; height: 14px;
+    border-radius: 50%;
+    font-size: 9px;
+    border: 1px solid var(--muted);
+    color: var(--muted);
+    cursor: pointer;
+    margin-left: 5px;
+    background: transparent;
+    font-family: var(--font);
+    line-height: 1;
+    flex-shrink: 0;
+    user-select: none;
+    vertical-align: middle;
+  }
+  .info-icon:hover { border-color: var(--accent); color: var(--accent); }
+
+  #sig-popup {
+    position: fixed;
+    background: var(--card);
+    border: 1px solid var(--accent);
+    border-radius: var(--radius-lg);
+    padding: 12px 36px 12px 14px;
+    width: 280px;
+    font-size: var(--font-size-xs);
+    line-height: 1.65;
+    z-index: 1000;
+    display: none;
+    box-shadow: 0 6px 24px rgba(0,0,0,0.35);
+  }
+  #sig-popup.visible { display: block; }
+  #sig-popup-title {
+    font-weight: 700;
+    margin-bottom: 6px;
+    color: var(--accent);
+    font-size: var(--font-size-sm);
+  }
+  #sig-popup-body { color: var(--text); }
+  #sig-popup-close {
+    position: absolute; top: 6px; right: 8px;
+    cursor: pointer; color: var(--muted);
+    background: transparent; border: none;
+    font-family: var(--font); font-size: 18px; line-height: 1;
+  }
+  #sig-popup-close:hover { color: var(--text); }
+
+  /* ── Context signal section (displayed below trigger signals) ── */
+  .context-divider {
+    font-size: var(--font-size-2xs);
+    text-transform: uppercase;
+    letter-spacing: .8px;
+    color: var(--muted);
+    margin: 8px 0 4px;
+    padding-top: 6px;
+    border-top: 1px dashed var(--border);
+  }
+
+  /* ── Backtest chart & signal accuracy table ─────────────────── */
+  .bt-sub-title {
+    font-size: var(--font-size-sm);
+    font-weight: 700;
+    color: var(--muted);
+    margin: 18px 0 8px;
+    text-transform: uppercase;
+    letter-spacing: .5px;
+  }
+  .bt-chart-wrap {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding: 16px 16px 10px;
+    margin-bottom: 16px;
+  }
+  #bt-chart { display: block; width: 100%; height: 220px; cursor: default; }
+  .bt-chart-legend {
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+    margin-top: 8px;
+    font-size: var(--font-size-2xs);
+    color: var(--muted);
+  }
+  .bt-legend-item { display: flex; align-items: center; gap: 5px; }
+  .bt-legend-swatch { width: 14px; height: 8px; border-radius: 2px; display: inline-block; }
+  .bt-sig-wrap { overflow-x: auto; margin-bottom: 16px; }
+  .bt-sig-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: var(--font-size-xs);
+  }
+  .bt-sig-table th {
+    text-align: left;
+    padding: 5px 8px;
+    border-bottom: 2px solid var(--border);
+    font-size: var(--font-size-2xs);
+    text-transform: uppercase;
+    letter-spacing: .5px;
+    color: var(--muted);
+    white-space: nowrap;
+  }
+  .bt-sig-table td { padding: 5px 8px; border-bottom: 1px solid var(--border); }
+  .wr-good { color: var(--bull); font-weight: 700; }
+  .wr-bad  { color: var(--bear); font-weight: 700; }
+  .wr-mid  { color: var(--text); }
 </style>
 </head>
 <body>
@@ -812,6 +964,27 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     <button class="hdr-btn" id="bt-run-btn" onclick="triggerBacktest()">Run Backtest</button>
   </div>
   <div class="bt-summary-grid" id="bt-summary-grid"></div>
+
+  <div class="bt-sub-title">Win Rate by Metal &amp; Direction</div>
+  <div class="bt-chart-wrap">
+    <canvas id="bt-chart"></canvas>
+    <div class="bt-chart-legend" id="bt-chart-legend"></div>
+  </div>
+
+  <div class="bt-sub-title">Per-Signal Lead Indicator Accuracy</div>
+  <div class="bt-sig-wrap">
+    <table class="bt-sig-table">
+      <thead><tr>
+        <th>Metal</th><th>Direction</th><th>Indicator</th><th>Events</th>
+        <th>Win% 5d</th><th>Avg Ret 5d</th><th>Win% 10d</th><th>Avg Ret 10d</th>
+      </tr></thead>
+      <tbody id="bt-sig-body">
+        <tr><td colspan="8" class="no-data" style="padding:12px 8px">Run backtest to see per-indicator accuracy</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="bt-sub-title">All Cluster Events</div>
   <div class="bt-table-wrap">
     <table id="bt-events-table">
       <thead><tr>
@@ -825,16 +998,24 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 </main>
 
+<div id="sig-popup">
+  <button id="sig-popup-close" onclick="hideSigInfo()">×</button>
+  <div id="sig-popup-title"></div>
+  <div id="sig-popup-body"></div>
+</div>
+
 <script>
 "use strict";
 
 // ── Theme ─────────────────────────────────────────────────────────────────────
+let _btData = null;  // hoisted before applyTheme IIFE to avoid TDZ
 // Single function that owns ALL theme state. Everything else calls applyTheme().
 function applyTheme(theme) {
   document.documentElement.setAttribute("data-theme", theme);
   const btn = document.getElementById("theme-btn");
   if (btn) btn.textContent = theme === "dark" ? "Light" : "Dark";
   try { localStorage.setItem("mm-theme", theme); } catch(_) {}
+  if (_btData) renderBtChart(_btData.summary);
 }
 
 function toggleTheme() {
@@ -940,11 +1121,38 @@ async function refreshLogs() {
 
 // ── Render helpers ────────────────────────────────────────────────────────────
 const METAL_CLASS = { Gold:"gold", Silver:"silver", Copper:"copper" };
-const SIG_LABELS  = {
-  futures_curve_proxy:       "Futures Curve",
-  etf_pressure_proxy:        "ETF Pressure",
-  physical_tightness_proxy:  "Physical Tightness",
-  demand_expectations_proxy: "Demand Expectations",
+
+// SIG_INFO — label and explanation for every signal (trigger and context).
+// body text is shown in the popup when the user clicks the info icon (i).
+const SIG_INFO = {
+  futures_curve_proxy: {
+    label: "Futures Curve",
+    body: "3-day price momentum vs a volatility-adjusted threshold. Bullish when the 3-day gain exceeds 1.25x the 60-day daily volatility x sqrt(3) — a rapid, outsized move. This proxies futures backwardation: when near-term supply is tight, buyers pay up urgently over 1-3 days. Counts toward cluster trigger."
+  },
+  etf_pressure_proxy: {
+    label: "ETF Pressure",
+    body: "Abnormal trading volume paired with a directional price move. Bullish: volume z-score > 1.5 (well above the 60-day average) AND the price rises on that day. High volume + direction = large investors moving in or out via ETF creation/redemption flow. Counts toward cluster trigger."
+  },
+  physical_tightness_proxy: {
+    label: "Physical Tightness",
+    body: "Price breaking to a new 20-day high (or low) while the intraday range expands above its 60-day average. An expanding range on a breakout signals urgency — buyers paying up to acquire physical metal, not just passive paper accumulation. Counts toward cluster trigger."
+  },
+  demand_expectations_proxy: {
+    label: "Demand Expectations",
+    body: "Three moving averages aligning across different timeframes. Bullish: 10-day MA above 30-day MA, price above 50-day MA, and positive 20-day return — all three must agree. This captures sustained directional repricing across weeks, not a single-day spike. Counts toward cluster trigger."
+  },
+  dollar_trend: {
+    label: "Dollar Trend (Context)",
+    body: "10-day momentum of UUP (US Dollar ETF), inverted for metals. Bullish when the dollar fell more than 1.5% in 10 days — a weaker dollar makes metals cheaper for non-US buyers globally, lifting demand. Bearish when the dollar rose more than 1.5%. Gold has the strongest inverse relationship (historical correlation -0.6 to -0.8). Context only — does not count toward cluster trigger."
+  },
+  vix_regime: {
+    label: "Fear Index / VIX (Context)",
+    body: "CBOE Volatility Index level and 5-day direction. For Gold and Silver: bullish when VIX is 20 or above and rising (fear building, safe-haven demand activates). Bearish when VIX is below 15 and falling (calm markets, no safe-haven need). For Copper: the logic inverts — high VIX signals recession fear, which reduces industrial demand. Context only — does not count toward cluster trigger."
+  },
+  cross_metal_ratio: {
+    label: "Cross-Metal Ratio (Context)",
+    body: "Relative value signal, specific to each metal. Silver: Gold/Silver ratio above 80 = historically undervalued (after 2008 peak of 84:1, silver rallied 391%). Gold: 10-day momentum of the G/S ratio — rising means institutional rotation toward gold. Copper: 10-day momentum of Copper/Gold ratio — rising signals an economic growth regime. Context only — does not count toward cluster trigger."
+  }
 };
 
 function renderMetals(metals) {
@@ -966,12 +1174,27 @@ function renderMetals(metals) {
     const close = typeof data.close === "number" ? data.close.toFixed(2) : "—";
     const date  = escHtml(data.date || "");
     let sigRows = "";
+    // Trigger signals — count toward the cluster (>=2 fires an alert)
     for (const [key, val] of Object.entries(data.all_signals || {})) {
-      const label = escHtml(SIG_LABELS[key] || key);
+      const info  = SIG_INFO[key] || {};
+      const label = escHtml(info.label || key.replace(/_/g, " "));
       const v     = escHtml(val);
       sigRows += `<div class="sig-row">
-        <span class="sig-label">${label}</span>
+        <span class="sig-label">${label}<button class="info-icon" onclick="showSigInfo('${key}',event)">i</button></span>
         <span class="sig-val ${v}">${v}</span></div>`;
+    }
+    // Context signals — cross-asset macro signals; display-only, do NOT affect cluster trigger
+    const ctx = data.context_signals || {};
+    if (Object.keys(ctx).length > 0) {
+      sigRows += `<div class="context-divider">Context signals (not in cluster)</div>`;
+      for (const [key, val] of Object.entries(ctx)) {
+        const info  = SIG_INFO[key] || {};
+        const label = escHtml(info.label || key.replace(/_/g, " "));
+        const v     = escHtml(val);
+        sigRows += `<div class="sig-row">
+          <span class="sig-label">${label}<button class="info-icon" onclick="showSigInfo('${key}',event)">i</button></span>
+          <span class="sig-val ${v}">${v}</span></div>`;
+      }
     }
     const nBull = data.n_bullish || 0;
     const nBear = data.n_bearish || 0;
@@ -1141,6 +1364,9 @@ async function triggerBacktest() {
         btn.textContent    = "Run Backtest";
         const n = (d.data.events || []).length;
         status.textContent = "Complete — " + n + " cluster events in 3yr window";
+        _btData = d.data;
+        renderBtChart(d.data.summary);
+        renderBtSignalStats(d.data.signal_stats || []);
         renderBtSummary(d.data.summary);
         renderBtEvents(d.data.events);
       } else if (Date.now() > deadline) {
@@ -1216,6 +1442,197 @@ function renderBtEvents(events) {
   tbody.innerHTML = html;
 }
 
+// ── Backtest chart (Canvas 2D) ────────────────────────────────────────────────
+function renderBtChart(summary) {
+  const canvas = document.getElementById("bt-chart");
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  const DPR = window.devicePixelRatio || 1;
+  const W   = canvas.offsetWidth || 600;
+  const H   = 220;
+  canvas.width  = Math.round(W * DPR);
+  canvas.height = Math.round(H * DPR);
+  canvas.style.width  = W + "px";
+  canvas.style.height = H + "px";
+  ctx.scale(DPR, DPR);
+  ctx.clearRect(0, 0, W, H);
+
+  const st = getComputedStyle(document.documentElement);
+  const C = {
+    gold:   st.getPropertyValue("--gold").trim()   || "#d4a843",
+    silver: st.getPropertyValue("--silver").trim() || "#9eaab5",
+    copper: st.getPropertyValue("--copper").trim() || "#b87044",
+    text:   st.getPropertyValue("--text").trim()   || "#e2e8f0",
+    muted:  st.getPropertyValue("--muted").trim()  || "#6b7280",
+    border: st.getPropertyValue("--border").trim() || "#374151",
+  };
+  const ORDER = [
+    { metal:"Gold",   dir:"bullish", color:C.gold   },
+    { metal:"Gold",   dir:"bearish", color:C.gold   },
+    { metal:"Silver", dir:"bullish", color:C.silver },
+    { metal:"Silver", dir:"bearish", color:C.silver },
+    { metal:"Copper", dir:"bullish", color:C.copper },
+    { metal:"Copper", dir:"bearish", color:C.copper },
+  ];
+  const lookup = {};
+  for (const s of Object.values(summary || {})) lookup[s.metal + "|" + s.direction] = s;
+
+  const PAD_L = 40, PAD_R = 10, PAD_T = 18, PAD_B = 38;
+  const cW = W - PAD_L - PAD_R;
+  const cH = H - PAD_T - PAD_B;
+  const groupW = cW / ORDER.length;
+  const barW   = Math.min(groupW * 0.3, 18);
+  const gap    = barW * 0.35;
+
+  ctx.font = "9px sans-serif";
+  ctx.textAlign = "right";
+  [0, 25, 50, 75, 100].forEach(pct => {
+    const y = PAD_T + cH * (1 - pct / 100);
+    ctx.beginPath();
+    ctx.moveTo(PAD_L, y);
+    ctx.lineTo(PAD_L + cW, y);
+    if (pct === 50) {
+      ctx.setLineDash([4, 3]);
+      ctx.strokeStyle = C.muted;
+      ctx.lineWidth   = 1.5;
+    } else {
+      ctx.setLineDash([]);
+      ctx.strokeStyle = C.border;
+      ctx.lineWidth   = 1;
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = C.muted;
+    ctx.fillText(pct + "%", PAD_L - 4, y + 3);
+  });
+
+  ORDER.forEach((grp, gi) => {
+    const s   = lookup[grp.metal + "|" + grp.dir];
+    const cx  = PAD_L + groupW * gi + groupW / 2;
+    const x5  = cx - gap / 2 - barW;
+    const x10 = cx + gap / 2;
+    function drawBar(x, wr, alpha) {
+      if (wr == null) return;
+      const barH = cH * wr / 100;
+      const y    = PAD_T + cH - barH;
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle   = grp.color;
+      ctx.fillRect(x, y, barW, barH);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle   = C.text;
+      ctx.font        = "9px sans-serif";
+      ctx.textAlign   = "center";
+      if (wr >= 5) ctx.fillText(Math.round(wr) + "%", x + barW / 2, y - 3);
+    }
+    drawBar(x5,  s ? s.win_rate_5d  : null, 1.0);
+    drawBar(x10, s ? s.win_rate_10d : null, 0.45);
+
+    const arrow = grp.dir === "bullish" ? "▲" : "▼";
+    ctx.fillStyle  = grp.color;
+    ctx.font       = "10px sans-serif";
+    ctx.textAlign  = "center";
+    ctx.fillText(grp.metal.slice(0, 2) + arrow, cx, H - PAD_B + 14);
+  });
+
+  // Legend via DOM to satisfy escHtml requirement
+  const legend = document.getElementById("bt-chart-legend");
+  if (legend) {
+    legend.textContent = "";
+    [
+      ["var(--muted)", 1.0,  "5-day win rate"],
+      ["var(--muted)", 0.45, "10-day win rate"],
+    ].forEach(([bg, op, label]) => {
+      const wrap = document.createElement("div");
+      wrap.className = "bt-legend-item";
+      const sw = document.createElement("span");
+      sw.className = "bt-legend-swatch";
+      sw.style.background = bg;
+      sw.style.opacity = op;
+      const txt = document.createTextNode(" " + label);
+      wrap.appendChild(sw);
+      wrap.appendChild(txt);
+      legend.appendChild(wrap);
+    });
+    const base = document.createElement("div");
+    base.className = "bt-legend-item";
+    const line = document.createElement("span");
+    line.style.cssText = "border-top:1px dashed var(--muted);display:inline-block;width:14px;height:0;vertical-align:middle";
+    const baseTxt = document.createTextNode("  50% = random chance");
+    base.appendChild(line);
+    base.appendChild(baseTxt);
+    legend.appendChild(base);
+  }
+}
+
+// ── Per-signal accuracy table ─────────────────────────────────────────────────
+function renderBtSignalStats(signalStats) {
+  const tbody = document.getElementById("bt-sig-body");
+  if (!tbody) return;
+  tbody.textContent = "";
+  if (!signalStats || !signalStats.length) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = 8;
+    td.className = "no-data";
+    td.style.padding = "12px 8px";
+    td.textContent = "No signal data";
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+    return;
+  }
+  const SIG_LBL = {
+    futures_curve_proxy:       "Futures Curve",
+    etf_pressure_proxy:        "ETF Pressure",
+    physical_tightness_proxy:  "Physical Tightness",
+    demand_expectations_proxy: "Demand Expectations",
+  };
+  const METAL_C = { Gold:"gold", Silver:"silver", Copper:"copper" };
+  function wrCls(wr) {
+    if (wr == null) return "fwd-nil";
+    return wr >= 55 ? "wr-good" : wr < 45 ? "wr-bad" : "wr-mid";
+  }
+  function makeCell(text, cls) {
+    const td = document.createElement("td");
+    if (cls) td.className = cls;
+    td.textContent = text;
+    return td;
+  }
+  let lastMetal = "";
+  for (const s of signalStats) {
+    const tr = document.createElement("tr");
+    const mc  = METAL_C[s.metal] || "";
+    const lbl = SIG_LBL[s.signal] || s.signal.replace(/_proxy$/, "").replace(/_/g, " ");
+
+    const tdMetal = document.createElement("td");
+    tdMetal.textContent = s.metal !== lastMetal ? s.metal : "";
+    tdMetal.style.color = "var(--" + mc + ")";
+
+    const tdDir = document.createElement("td");
+    const pill = document.createElement("span");
+    pill.className = "pill " + (s.direction === "bullish" ? "bull" : "bear");
+    pill.textContent = s.direction === "bullish" ? "▲ Bullish" : "▼ Bearish";
+    tdDir.appendChild(pill);
+
+    const wr5  = s.win_rate_5d  != null ? Math.round(s.win_rate_5d)  + "%" : "—";
+    const wr10 = s.win_rate_10d != null ? Math.round(s.win_rate_10d) + "%" : "—";
+    const r5   = s.avg_ret_5d  != null ? (s.avg_ret_5d  >= 0 ? "+" : "") + s.avg_ret_5d  + "%" : "—";
+    const r10  = s.avg_ret_10d != null ? (s.avg_ret_10d >= 0 ? "+" : "") + s.avg_ret_10d + "%" : "—";
+    const r5cls  = s.avg_ret_5d  != null ? (s.avg_ret_5d  > 0 ? "fwd-pos" : s.avg_ret_5d  < 0 ? "fwd-neg" : "fwd-nil") : "fwd-nil";
+    const r10cls = s.avg_ret_10d != null ? (s.avg_ret_10d > 0 ? "fwd-pos" : s.avg_ret_10d < 0 ? "fwd-neg" : "fwd-nil") : "fwd-nil";
+
+    tr.appendChild(tdMetal);
+    tr.appendChild(tdDir);
+    tr.appendChild(makeCell(lbl, ""));
+    tr.appendChild(makeCell(String(s.count), ""));
+    tr.appendChild(makeCell(wr5,  wrCls(s.win_rate_5d)));
+    tr.appendChild(makeCell(r5,   r5cls));
+    tr.appendChild(makeCell(wr10, wrCls(s.win_rate_10d)));
+    tr.appendChild(makeCell(r10,  r10cls));
+    tbody.appendChild(tr);
+    lastMetal = s.metal;
+  }
+}
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 (async () => {
   try {
@@ -1233,6 +1650,9 @@ function renderBtEvents(events) {
       const n = bd.data.events.length;
       document.getElementById("bt-status").textContent =
         "Complete — " + n + " cluster events in 3yr window";
+      _btData = bd.data;
+      renderBtChart(bd.data.summary);
+      renderBtSignalStats(bd.data.signal_stats || []);
       renderBtSummary(bd.data.summary);
       renderBtEvents(bd.data.events);
     }
@@ -1245,6 +1665,33 @@ if (Notification.permission === "granted") {
   btn.textContent = "Notifications On";
   btn.className   = "granted";
 }
+
+// ── Signal info popup ─────────────────────────────────────────────────────────
+function showSigInfo(key, event) {
+  event.stopPropagation();
+  const info = SIG_INFO[key];
+  if (!info) return;
+  const popup = document.getElementById("sig-popup");
+  document.getElementById("sig-popup-title").textContent = info.label;
+  document.getElementById("sig-popup-body").textContent  = info.body;
+  const rect = event.target.getBoundingClientRect();
+  const W = 280;
+  let left = rect.right + 8;
+  if (left + W > window.innerWidth - 8) left = rect.left - W - 8;
+  if (left < 8) left = 8;
+  let top = rect.top - 4;
+  if (top + 220 > window.innerHeight - 8) top = window.innerHeight - 228;
+  if (top < 8) top = 8;
+  popup.style.left = left + "px";
+  popup.style.top  = top  + "px";
+  popup.classList.add("visible");
+}
+
+function hideSigInfo() {
+  document.getElementById("sig-popup").classList.remove("visible");
+}
+
+document.addEventListener("click", hideSigInfo);
 </script>
 </body>
 </html>
