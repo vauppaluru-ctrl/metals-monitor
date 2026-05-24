@@ -16,6 +16,7 @@ metals_backtest_output/
 
 # Generated files (created by install script from template)
 com.local.metalsmonitor.plist
+com.local.metalswebserver.plist
 
 # macOS
 .DS_Store
